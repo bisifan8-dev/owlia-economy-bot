@@ -82,14 +82,14 @@ Built with **Python** and **discord.py**, it features a SQLite database for pers
 ### Prerequisites
 
 - **Python 3.8+** installed
-- **Discord Bot Token** ([Create one here](https://discord.com/developers/applications))
+- **Discord Bot Token** ([Get yours here](https://discord.com/developers/applications/1533286330879050019/))
 - **Git** (optional, for cloning)
 
 ### Installation
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/owlia-economy-bot.git
+git clone https://github.com/bisifan8-dev/owlia-economy-bot.git
 cd owlia-economy-bot
 
 # 2. Create and activate virtual environment
@@ -106,7 +106,9 @@ echo "DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE" > .env
 python main.py
 ```
 
-### Docker Deployment
+### Docker Deployment (Optional)
+
+> **Note:** Official Docker images are not yet available. You can build your own using the provided Dockerfile.
 
 ```dockerfile
 # Dockerfile
@@ -400,6 +402,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Made with ❤️ for the Discord community**
 
-[Report Bug](https://github.com/yourusername/owlia-economy-bot/issues) · [Request Feature](https://github.com/yourusername/owlia-economy-bot/issues)
+[Report Bug](https://github.com/bisifan8-dev/owlia-economy-bot/issues) · [Request Feature](https://github.com/bisifan8-dev/owlia-economy-bot/issues)
 
-</div># owlia-economy-bot
+</div>
+
+You can now copy this entire content and replace your existing `README.md` file with it. The bot invite link includes `permissions=8` (Administrator), so users will be able to grant all necessary permissions in one click.
