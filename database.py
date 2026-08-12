@@ -221,6 +221,20 @@ def init_db():
         """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transaction_log (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                transaction_type TEXT,
+                amount REAL,
+                description TEXT,
+                party_id TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
         # Schema Migration Checks - Parties Table
         cursor.execute("PRAGMA table_info(parties)")
         columns = [col["name"] for col in cursor.fetchall()]
@@ -523,6 +537,35 @@ def check_user_can_buy(user_id: int) -> bool:
     """Check if user has debt that prevents them from buying."""
     debt = get_user_debt(user_id)
     return debt <= 0.001  # Allow small floating point errors
+
+
+def get_user_transactions(user_id: int, limit: int = 50, offset: int = 0):
+    """Get user's transaction history with pagination."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT log_id, transaction_type, amount, description, party_id, timestamp
+            FROM transaction_log 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC 
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, limit, offset)
+        )
+        return cursor.fetchall()
+
+
+def get_transaction_count(user_id: int) -> int:
+    """Get total number of transactions for a user."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) as total FROM transaction_log WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        return row["total"] if row else 0
 
 
 async def execute_trade(

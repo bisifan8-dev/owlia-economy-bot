@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 from database import get_db
 from views import BuyFromBotView, ManageStockOrderSelect
+from utils.errors import SmartErrorMessages
+from cogs.modals import ConfirmPurchaseModal, ConfirmSellModal
 
 
 class MarketCog(commands.Cog):
@@ -30,7 +32,10 @@ class MarketCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild_id
         if shares <= 0:
-            await interaction.followup.send("❌ Shares must be positive.")
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(shares, 0.01, 1000000.0),
+                ephemeral=True
+            )
             return
 
         clean_party_id = party_id.strip().lower()
@@ -46,7 +51,8 @@ class MarketCog(commands.Cog):
 
             if not party:
                 await interaction.followup.send(
-                    f"❌ Entity `{clean_party_id}` does not exist."
+                    SmartErrorMessages.party_not_found(clean_party_id),
+                    ephemeral=True
                 )
                 return
 
@@ -101,48 +107,96 @@ class MarketCog(commands.Cog):
 
             if user_bal < total_cost:
                 await interaction.followup.send(
-                    f"❌ Insufficient funds! Cost: **${total_cost:.2f}**, Balance: **${user_bal:.2f}**."
+                    SmartErrorMessages.insufficient_funds(user_bal, total_cost, "buy"),
+                    ephemeral=True
                 )
                 return
 
             if not party["is_company"] and ai_shares >= shares and actual_price == standard_cost:
-                cursor.execute(
-                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                    (total_cost, interaction.user.id),
+                # Show confirmation modal for direct purchase
+                async def execute_direct_purchase(modal_interaction: discord.Interaction):
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                            (total_cost, interaction.user.id),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
+                            ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
+                        """,
+                            (interaction.user.id, clean_party_id, shares, shares),
+                        )
+                        
+                        # Log transaction
+                        cursor.execute(
+                            """
+                            INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (interaction.user.id, "buy", -total_cost, f"Purchased {shares:.2f} shares of {party['name']}", clean_party_id)
+                        )
+                        conn.commit()
+                        
+                    await modal_interaction.response.send_message(
+                        f"✅ Purchased {shares:.2f} shares of **{party['name']}** directly from AI at **${actual_price:.2f}** each!",
+                        ephemeral=True
+                    )
+                    if guild_id:
+                        await self.bot.refresh_market_embeds(guild_id)
+                
+                modal = ConfirmPurchaseModal(
+                    party['name'],
+                    shares,
+                    actual_price,
+                    total_cost,
+                    execute_direct_purchase
                 )
-                cursor.execute(
-                    """
-                    INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
-                    ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
-                """,
-                    (interaction.user.id, clean_party_id, shares, shares),
-                )
-                conn.commit()
-                await interaction.followup.send(
-                    f"✅ Purchased {shares:.2f} shares of **{party['name']}** directly from AI at **${actual_price:.2f}** each!"
-                )
-                if guild_id:
-                    await self.bot.refresh_market_embeds(guild_id)
+                await interaction.followup.send_modal(modal)
                 return
 
-            cursor.execute(
-                "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                (total_cost, interaction.user.id),
-            )
-            cursor.execute(
-                """
-                INSERT INTO market_orders (user_id, party_id, order_type, shares_count, price_per_share)
-                VALUES (?, ?, 'BUY', ?, ?)
-            """,
-                (interaction.user.id, clean_party_id, shares, actual_price),
-            )
-            conn.commit()
+            # Show confirmation for market order
+            async def execute_market_order(modal_interaction: discord.Interaction):
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                        (total_cost, interaction.user.id),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO market_orders (user_id, party_id, order_type, shares_count, price_per_share)
+                        VALUES (?, ?, 'BUY', ?, ?)
+                    """,
+                        (interaction.user.id, clean_party_id, shares, actual_price),
+                    )
+                    
+                    # Log transaction
+                    cursor.execute(
+                        """
+                        INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (interaction.user.id, "buy", -total_cost, f"Buy order for {shares:.2f} shares of {party['name']}", clean_party_id)
+                    )
+                    conn.commit()
 
-        if guild_id:
-            await self.bot.refresh_market_embeds(guild_id)
-        await interaction.followup.send(
-            f"✅ Posted buy offer for **{shares:.2f}** share(s) of **{party['name']}** at **${actual_price:.2f}** each!"
-        )
+                if guild_id:
+                    await self.bot.refresh_market_embeds(guild_id)
+                await modal_interaction.response.send_message(
+                    f"✅ Posted buy offer for **{shares:.2f}** share(s) of **{party['name']}** at **${actual_price:.2f}** each!",
+                    ephemeral=True
+                )
+
+            modal = ConfirmPurchaseModal(
+                party['name'],
+                shares,
+                actual_price,
+                total_cost,
+                execute_market_order
+            )
+            await interaction.followup.send_modal(modal)
 
     @app_commands.command(
         name="sell", description="Create a sell order for shares you own."
@@ -163,7 +217,8 @@ class MarketCog(commands.Cog):
         guild_id = interaction.guild_id
         if shares <= 0 or price_per_share <= 0:
             await interaction.followup.send(
-                "❌ Shares and price must be positive."
+                SmartErrorMessages.invalid_amount(shares if shares <= 0 else price_per_share, 0.01, 1000000.0),
+                ephemeral=True
             )
             return
 
@@ -178,7 +233,8 @@ class MarketCog(commands.Cog):
 
             if not party:
                 await interaction.followup.send(
-                    f"❌ Entity `{clean_party_id}` does not exist."
+                    SmartErrorMessages.party_not_found(clean_party_id),
+                    ephemeral=True
                 )
                 return
 
@@ -191,28 +247,54 @@ class MarketCog(commands.Cog):
 
             if owned < shares:
                 await interaction.followup.send(
-                    f"❌ You only own **{owned:.2f}** shares."
+                    SmartErrorMessages.insufficient_shares(owned, shares, party['name']),
+                    ephemeral=True
                 )
                 return
 
-            cursor.execute(
-                "UPDATE shares SET shares_owned = shares_owned - ? WHERE user_id = ? AND party_id = ?",
-                (shares, interaction.user.id, clean_party_id),
-            )
-            cursor.execute(
-                """
-                INSERT INTO market_orders (user_id, party_id, order_type, shares_count, price_per_share)
-                VALUES (?, ?, 'SELL', ?, ?)
-            """,
-                (interaction.user.id, clean_party_id, shares, price_per_share),
-            )
-            conn.commit()
+        # Show confirmation modal
+        total_value = shares * price_per_share
+        
+        async def execute_sell(modal_interaction: discord.Interaction):
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE shares SET shares_owned = shares_owned - ? WHERE user_id = ? AND party_id = ?",
+                    (shares, interaction.user.id, clean_party_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO market_orders (user_id, party_id, order_type, shares_count, price_per_share)
+                    VALUES (?, ?, 'SELL', ?, ?)
+                """,
+                    (interaction.user.id, clean_party_id, shares, price_per_share),
+                )
+                
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (interaction.user.id, "sell", shares * price_per_share, f"Sell order for {shares:.2f} shares of {party['name']}", clean_party_id)
+                )
+                conn.commit()
 
-        if guild_id:
-            await self.bot.refresh_market_embeds(guild_id)
-        await interaction.followup.send(
-            f"✅ Posted sell offer for **{shares:.2f}** share(s) of **{party['name']}** at **${price_per_share:.2f}** each!"
+            if guild_id:
+                await self.bot.refresh_market_embeds(guild_id)
+            await modal_interaction.response.send_message(
+                f"✅ Posted sell offer for **{shares:.2f}** share(s) of **{party['name']}** at **${price_per_share:.2f}** each!",
+                ephemeral=True
+            )
+
+        modal = ConfirmSellModal(
+            party['name'],
+            shares,
+            price_per_share,
+            total_value,
+            execute_sell
         )
+        await interaction.followup.send_modal(modal)
 
     @app_commands.command(
         name="manage_stock",

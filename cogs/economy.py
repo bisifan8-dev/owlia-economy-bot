@@ -4,8 +4,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from database import get_db, get_user_managed_parties
-from views import TreasuryPartySelect
+from views import TreasuryPartySelect, HistoryView
 from safety import safety_wrapper, financial_safety, InputValidator
+from utils.errors import SmartErrorMessages
+from cogs.modals import ConfirmTransactionModal
 
 
 class EconomyCog(commands.Cog):
@@ -89,29 +91,38 @@ class EconomyCog(commands.Cog):
         target: discord.User,
         amount: float
     ):
-        await interaction.response.defer(ephemeral=True)
-
         # Safety: Validate amount
         valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
         if not valid:
-            await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+            await interaction.response.send_message(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         if amount <= 0:
-            await interaction.followup.send("❌ Amount must be greater than zero.")
+            await interaction.response.send_message(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         if target.id == interaction.user.id:
-            await interaction.followup.send("❌ You cannot send money to yourself.")
+            await interaction.response.send_message(
+                "❌ You cannot send money to yourself.",
+                ephemeral=True
+            )
             return
 
         if target.bot:
-            await interaction.followup.send("❌ You cannot send money to bots.")
+            await interaction.response.send_message(
+                "❌ You cannot send money to bots.",
+                ephemeral=True
+            )
             return
 
         with get_db() as conn:
             cursor = conn.cursor()
-
             cursor.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
                 (interaction.user.id,)
@@ -120,35 +131,67 @@ class EconomyCog(commands.Cog):
             sender_bal = sender_row["balance"] if sender_row else 0.0
 
             if sender_bal < amount:
-                await interaction.followup.send(
-                    f"❌ Insufficient funds! You have **${sender_bal:.2f}**, but tried to send **${amount:.2f}**."
+                await interaction.response.send_message(
+                    SmartErrorMessages.insufficient_funds(sender_bal, amount, "pay"),
+                    ephemeral=True
                 )
                 return
 
-            cursor.execute(
-                "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                (amount, interaction.user.id)
+        # Show confirmation modal
+        async def execute_payment(modal_interaction: discord.Interaction):
+            with get_db() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                    (amount, interaction.user.id)
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO users (user_id, balance, message_count, premium_credits) VALUES (?, ?, 0, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+                """,
+                    (target.id, amount, amount)
+                )
+                
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (interaction.user.id, "pay", -amount, f"Payment to {target.display_name}", None)
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (target.id, "pay", amount, f"Payment from {interaction.user.display_name}", None)
+                )
+                conn.commit()
+
+            await modal_interaction.response.send_message(
+                f"✅ Successfully sent **${amount:.2f}** to {target.mention}!",
+                ephemeral=True
             )
 
-            cursor.execute(
-                """
-                INSERT INTO users (user_id, balance, message_count, premium_credits) VALUES (?, ?, 0, 0)
-                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
-            """,
-                (target.id, amount, amount)
-            )
-            conn.commit()
+            try:
+                await target.send(
+                    f"💸 **{interaction.user.display_name}** sent you **${amount:.2f}**!"
+                )
+            except discord.Forbidden:
+                pass
 
-        await interaction.followup.send(
-            f"✅ Successfully sent **${amount:.2f}** to {target.mention}!"
+        modal = ConfirmTransactionModal(
+            "pay",
+            amount,
+            target.display_name,
+            execute_payment,
+            "pay"
         )
-
-        try:
-            await target.send(
-                f"💸 **{interaction.user.display_name}** sent you **${amount:.2f}**!"
-            )
-        except discord.Forbidden:
-            pass
+        await interaction.response.send_modal(modal)
 
     @app_commands.command(
         name="messages",
@@ -267,11 +310,17 @@ class EconomyCog(commands.Cog):
         # Safety: Validate amount
         valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
         if not valid:
-            await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
         
         if amount <= 0:
-            await interaction.followup.send("❌ Amount must be greater than zero.")
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         clean_party_id = party_id.strip().lower()
@@ -282,34 +331,68 @@ class EconomyCog(commands.Cog):
 
         if not party:
             await interaction.followup.send(
-                f"❌ You do not manage entity `{clean_party_id}`."
+                f"❌ You do not manage entity `{clean_party_id}`.",
+                ephemeral=True
             )
             return
 
         if party["treasury"] < amount:
             await interaction.followup.send(
-                f"❌ Insufficient treasury funds. Treasury has **${party['treasury']:.2f}**."
+                SmartErrorMessages.insufficient_treasury(
+                    party["treasury"], 
+                    amount, 
+                    party["name"]
+                ),
+                ephemeral=True
             )
             return
 
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
-                (amount, clean_party_id),
-            )
-            cursor.execute(
-                """
-                INSERT INTO users (user_id, balance, message_count, premium_credits) VALUES (?, ?, 0, 0)
-                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
-            """,
-                (target.id, amount, amount),
-            )
-            conn.commit()
+        # Show confirmation modal
+        async def execute_treasury_spend(modal_interaction: discord.Interaction):
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
+                    (amount, clean_party_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO users (user_id, balance, message_count, premium_credits) VALUES (?, ?, 0, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+                """,
+                    (target.id, amount, amount),
+                )
+                
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (interaction.user.id, "treasury_spend", -amount, f"Treasury spend from {party['name']} to {target.display_name}", clean_party_id)
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (target.id, "treasury_spend", amount, f"Treasury payment from {party['name']}", clean_party_id)
+                )
+                conn.commit()
 
-        await interaction.followup.send(
-            f"✅ Transferred **${amount:.2f}** from **{party['name']}** Treasury to {target.mention}."
+            await modal_interaction.response.send_message(
+                f"✅ Transferred **${amount:.2f}** from **{party['name']}** Treasury to {target.mention}.",
+                ephemeral=True
+            )
+
+        modal = ConfirmTransactionModal(
+            "treasury spend",
+            amount,
+            f"{party['name']} → {target.display_name}",
+            execute_treasury_spend,
+            "treasury_spend"
         )
+        await interaction.followup.send_modal(modal)
 
     @app_commands.command(
         name="party_bid",
@@ -339,7 +422,10 @@ class EconomyCog(commands.Cog):
         if bid_amount > 0:
             valid, msg = InputValidator.validate_amount(bid_amount, allow_zero=False)
             if not valid:
-                await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+                await interaction.followup.send(
+                    SmartErrorMessages.invalid_amount(bid_amount),
+                    ephemeral=True
+                )
                 return
         
         guild_id = interaction.guild_id
@@ -352,7 +438,8 @@ class EconomyCog(commands.Cog):
 
         if not party:
             await interaction.followup.send(
-                f"❌ You do not manage party `{clean_party_id}`."
+                f"❌ You do not manage party `{clean_party_id}`.",
+                ephemeral=True
             )
             return
 
@@ -374,14 +461,20 @@ class EconomyCog(commands.Cog):
         else:
             if bid_amount <= current_bid["amount"]:
                 await interaction.followup.send(
-                    f"❌ Counter-bid must be higher than current highest bid of **${current_bid['amount']:.2f}**."
+                    f"❌ Counter-bid must be higher than current highest bid of **${current_bid['amount']:.2f}**.",
+                    ephemeral=True
                 )
                 return
             offer = bid_amount
 
         if party["treasury"] < offer:
             await interaction.followup.send(
-                f"❌ Insufficient treasury funds. Party treasury: **${party['treasury']:.2f}**."
+                SmartErrorMessages.insufficient_treasury(
+                    party["treasury"],
+                    offer,
+                    party["name"]
+                ),
+                ephemeral=True
             )
             return
 
@@ -390,6 +483,15 @@ class EconomyCog(commands.Cog):
             cursor.execute(
                 "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
                 (offer, clean_party_id),
+            )
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "party_bid", -offer, f"Bid for {party['name']}", clean_party_id)
             )
             conn.commit()
 
@@ -423,7 +525,8 @@ class EconomyCog(commands.Cog):
                 )
 
         await interaction.followup.send(
-            f"✅ Placed bid of **${offer:.2f}** for **{party['name']}**."
+            f"✅ Placed bid of **${offer:.2f}** for **{party['name']}**.",
+            ephemeral=True
         )
 
     @app_commands.command(
@@ -454,7 +557,8 @@ class EconomyCog(commands.Cog):
 
             if user_bal < 1.0:
                 await interaction.followup.send(
-                    f"❌ You need at least **$1.00** to post a paid message. Balance: **${user_bal:.2f}**."
+                    SmartErrorMessages.insufficient_funds(user_bal, 1.0, "paid_message"),
+                    ephemeral=True
                 )
                 return
 
@@ -465,14 +569,16 @@ class EconomyCog(commands.Cog):
             cfg = cursor.fetchone()
             if not cfg or not cfg["paid_channel_id"]:
                 await interaction.followup.send(
-                    "❌ Paid channel is not configured."
+                    "❌ Paid channel is not configured.",
+                    ephemeral=True
                 )
                 return
 
             chan = interaction.guild.get_channel(cfg["paid_channel_id"])
             if not chan:
                 await interaction.followup.send(
-                    "❌ Could not locate paid channel."
+                    "❌ Could not locate paid channel.",
+                    ephemeral=True
                 )
                 return
 
@@ -480,13 +586,23 @@ class EconomyCog(commands.Cog):
                 "UPDATE users SET balance = balance - 1.0 WHERE user_id = ?",
                 (interaction.user.id,),
             )
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "paid_message", -1.0, f"Paid message: {message_text[:50]}...", None)
+            )
             conn.commit()
 
         await chan.send(
             f"📣 **Paid Message from {interaction.user.mention}:**\n{message_text}"
         )
         await interaction.followup.send(
-            "✅ Paid message posted successfully ($1.00 deducted)!"
+            "✅ Paid message posted successfully ($1.00 deducted)!",
+            ephemeral=True
         )
 
     @app_commands.command(
@@ -732,6 +848,74 @@ class EconomyCog(commands.Cog):
         )
         
         await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="history",
+        description="📜 View your transaction history with pagination."
+    )
+    @app_commands.describe(
+        page="Page number to view (starts at 1)"
+    )
+    @safety_wrapper("default")
+    async def history(
+        self,
+        interaction: discord.Interaction,
+        page: int = 1
+    ):
+        """View user's transaction history with pagination."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if page < 1:
+            page = 1
+        
+        per_page = 5
+        offset = (page - 1) * per_page
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Get total count for pagination
+            cursor.execute(
+                "SELECT COUNT(*) as total FROM transaction_log WHERE user_id = ?",
+                (interaction.user.id,)
+            )
+            total_row = cursor.fetchone()
+            total = total_row["total"] if total_row else 0
+            
+            if total == 0:
+                await interaction.followup.send(
+                    "📭 You have no transaction history yet.",
+                    ephemeral=True
+                )
+                return
+            
+            # Get transactions for current page
+            cursor.execute(
+                """
+                SELECT log_id, transaction_type, amount, description, party_id, timestamp
+                FROM transaction_log 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+                """,
+                (interaction.user.id, per_page, offset)
+            )
+            transactions = cursor.fetchall()
+        
+        total_pages = (total + per_page - 1) // per_page
+        
+        if page > total_pages:
+            await interaction.followup.send(
+                f"❌ Page {page} doesn't exist. Total pages: {total_pages}",
+                ephemeral=True
+            )
+            return
+        
+        # Create the view with pagination
+        view = HistoryView(transactions, page, total_pages, total, self.bot)
+        embed = view.get_embed()
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 async def setup(bot):

@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from database import get_db, get_user_managed_parties, is_company_shareholder, get_user_share_weight
 import datetime
+from utils.errors import SmartErrorMessages
+from cogs.modals import ConfirmTransactionModal, ConfirmLoanRepaymentModal
 
 
 class CompanyCog(commands.Cog):
@@ -97,7 +99,7 @@ class CompanyCog(commands.Cog):
             cursor = conn.cursor()
             cursor.execute("SELECT party_id FROM parties WHERE party_id = ?", (clean_id,))
             if cursor.fetchone():
-                await interaction.followup.send("❌ Company/Party ID already exists.")
+                await interaction.followup.send(SmartErrorMessages.already_exists(clean_id, "Company"))
                 return
 
             # Create roles
@@ -183,7 +185,10 @@ class CompanyCog(commands.Cog):
         clean_id = company_id.strip().lower()
 
         if amount <= 0:
-            await interaction.followup.send("❌ Investment must be greater than zero.")
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         with get_db() as conn:
@@ -192,7 +197,10 @@ class CompanyCog(commands.Cog):
             company = cursor.fetchone()
 
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             cursor.execute("SELECT balance FROM users WHERE user_id = ?", (interaction.user.id,))
@@ -200,78 +208,106 @@ class CompanyCog(commands.Cog):
             bal = u_row["balance"] if u_row else 0.0
 
             if bal < amount:
-                await interaction.followup.send(f"❌ Insufficient funds! Balance: **${bal:.2f}**.")
+                await interaction.followup.send(
+                    SmartErrorMessages.insufficient_funds(bal, amount, "invest"),
+                    ephemeral=True
+                )
                 return
 
-            # Update user balance
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, interaction.user.id))
-            
-            # Update company treasury
-            cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?", (amount, clean_id))
-            
-            # Track investment
-            cursor.execute(
-                """
-                INSERT INTO company_investments (company_id, user_id, amount) VALUES (?, ?, ?)
-                ON CONFLICT(company_id, user_id) DO UPDATE SET amount = amount + ?
-                """,
-                (clean_id, interaction.user.id, amount, amount)
-            )
-
-            # Calculate shares issued based on current price or proportional
-            cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (clean_id,))
-            p_info = cursor.fetchone()
-            
-            total_treasury = p_info["treasury"]
-            total_shares = p_info["total_shares"]
-            
-            # If there's no treasury yet, first investment gets all shares
-            if total_treasury == amount:  # First investment
-                shares_owned = total_shares
-            else:
-                # Proportional shares based on investment / new treasury * total shares
-                shares_owned = (amount / total_treasury) * total_shares
-            
-            cursor.execute(
-                """
-                INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
-                ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
-                """,
-                (interaction.user.id, clean_id, shares_owned, shares_owned)
-            )
-
-            # Update stock history
-            new_price = total_treasury / total_shares if total_shares > 0 else 0.0
-            cursor.execute("INSERT INTO stock_history (party_id, price) VALUES (?, ?)", (clean_id, new_price))
-            
-            conn.commit()
-
-        # Check if partnership and need to set CEO if first partner
-        if company["structure_type"] == "partnership":
+        # Show confirmation modal
+        async def execute_investment(modal_interaction: discord.Interaction):
             with get_db() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) as count FROM shares WHERE party_id = ? AND shares_owned > 0", (clean_id,))
-                shareholder_count = cursor.fetchone()["count"]
                 
-                if shareholder_count == 1:
-                    # First partner becomes CEO
-                    cursor.execute(
-                        "INSERT INTO board_members (company_id, user_id, seat_number) VALUES (?, ?, 0)",
-                        (clean_id, interaction.user.id)
-                    )
-                    conn.commit()
-                    ceo_msg = "\n🎉 You are the first investor and have been appointed CEO!"
-                elif shareholder_count >= 2 and shareholder_count <= 5:
-                    ceo_msg = f"\n📋 Partnership now has {shareholder_count}/5 partners."
-                else:
-                    ceo_msg = ""
+                # Update user balance
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, interaction.user.id))
+                
+                # Update company treasury
+                cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?", (amount, clean_id))
+                
+                # Track investment
+                cursor.execute(
+                    """
+                    INSERT INTO company_investments (company_id, user_id, amount) VALUES (?, ?, ?)
+                    ON CONFLICT(company_id, user_id) DO UPDATE SET amount = amount + ?
+                    """,
+                    (clean_id, interaction.user.id, amount, amount)
+                )
 
-        await interaction.followup.send(
-            f"✅ Invested **${amount:.2f}** into **{company['name']}**!\n"
-            f"• Received **{shares_owned:.2f}** shares\n"
-            f"• Share price: **${new_price:.2f}**\n"
-            f"• Treasury: **${total_treasury:.2f}**{ceo_msg if company['structure_type'] == 'partnership' else ''}"
+                # Calculate shares issued based on current price or proportional
+                cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (clean_id,))
+                p_info = cursor.fetchone()
+                
+                total_treasury = p_info["treasury"]
+                total_shares = p_info["total_shares"]
+                
+                # If there's no treasury yet, first investment gets all shares
+                if total_treasury == amount:  # First investment
+                    shares_owned = total_shares
+                else:
+                    # Proportional shares based on investment / new treasury * total shares
+                    shares_owned = (amount / total_treasury) * total_shares
+                
+                cursor.execute(
+                    """
+                    INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
+                    """,
+                    (interaction.user.id, clean_id, shares_owned, shares_owned)
+                )
+
+                # Update stock history
+                new_price = total_treasury / total_shares if total_shares > 0 else 0.0
+                cursor.execute("INSERT INTO stock_history (party_id, price) VALUES (?, ?)", (clean_id, new_price))
+                
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (interaction.user.id, "invest", -amount, f"Investment in {company['name']}", clean_id)
+                )
+                
+                conn.commit()
+
+            # Check if partnership and need to set CEO if first partner
+            ceo_msg = ""
+            if company["structure_type"] == "partnership":
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) as count FROM shares WHERE party_id = ? AND shares_owned > 0", (clean_id,))
+                    shareholder_count = cursor.fetchone()["count"]
+                    
+                    if shareholder_count == 1:
+                        # First partner becomes CEO
+                        cursor.execute(
+                            "INSERT INTO board_members (company_id, user_id, seat_number) VALUES (?, ?, 0)",
+                            (clean_id, interaction.user.id)
+                        )
+                        conn.commit()
+                        ceo_msg = "\n🎉 You are the first investor and have been appointed CEO!"
+                    elif shareholder_count >= 2 and shareholder_count <= 5:
+                        ceo_msg = f"\n📋 Partnership now has {shareholder_count}/5 partners."
+                    else:
+                        ceo_msg = ""
+
+            await modal_interaction.response.send_message(
+                f"✅ Invested **${amount:.2f}** into **{company['name']}**!\n"
+                f"• Received **{shares_owned:.2f}** shares\n"
+                f"• Share price: **${new_price:.2f}**\n"
+                f"• Treasury: **${total_treasury:.2f}**{ceo_msg}",
+                ephemeral=True
+            )
+
+        modal = ConfirmTransactionModal(
+            "invest",
+            amount,
+            company['name'],
+            execute_investment,
+            "invest"
         )
+        await interaction.followup.send_modal(modal)
 
     @app_commands.command(
         name="company_info",
@@ -293,7 +329,10 @@ class CompanyCog(commands.Cog):
             company = cursor.fetchone()
             
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             # Get shareholders
@@ -382,7 +421,7 @@ class CompanyCog(commands.Cog):
 
         # Check if voter is a shareholder
         if not is_company_shareholder(interaction.user.id, clean_id):
-            await interaction.followup.send("❌ You must be a shareholder to vote for CEO.")
+            await interaction.followup.send(SmartErrorMessages.must_be_shareholder(clean_id))
             return
 
         # Check if candidate is a shareholder
@@ -400,7 +439,10 @@ class CompanyCog(commands.Cog):
             )
             company = cursor.fetchone()
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             # Check if user already voted
@@ -409,7 +451,10 @@ class CompanyCog(commands.Cog):
                 (interaction.user.id, clean_id)
             )
             if cursor.fetchone():
-                await interaction.followup.send("❌ You've already voted in this CEO election.")
+                await interaction.followup.send(
+                    SmartErrorMessages.already_voted(),
+                    ephemeral=True
+                )
                 return
 
             # Record vote (using election_id=0 for CEO votes)
@@ -471,7 +516,10 @@ class CompanyCog(commands.Cog):
             )
             company = cursor.fetchone()
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             # Get vote results
@@ -544,7 +592,10 @@ class CompanyCog(commands.Cog):
         clean_id = company_id.strip().lower()
 
         if amount <= 0:
-            await interaction.followup.send("❌ Loan amount must be greater than zero.")
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         if duration_hours < 1 or duration_hours > 720:  # Max 30 days
@@ -565,11 +616,17 @@ class CompanyCog(commands.Cog):
             )
             company = cursor.fetchone()
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             if company["treasury"] < amount:
-                await interaction.followup.send(f"❌ Company treasury insufficient. Has **${company['treasury']:.2f}**, needs **${amount:.2f}**.")
+                await interaction.followup.send(
+                    SmartErrorMessages.insufficient_treasury(company["treasury"], amount, company["name"]),
+                    ephemeral=True
+                )
                 return
 
             # Check if user already has pending loan with this company
@@ -647,7 +704,10 @@ class CompanyCog(commands.Cog):
             loan = cursor.fetchone()
             
             if not loan:
-                await interaction.followup.send(f"❌ Loan request #{request_id} not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.loan_not_found(request_id),
+                    ephemeral=True
+                )
                 return
 
             if loan["status"] != "PENDING":
@@ -662,12 +722,15 @@ class CompanyCog(commands.Cog):
             )
 
             if not (is_admin or is_manager):
-                await interaction.followup.send("❌ You don't have permission to approve loans for this company.")
+                await interaction.followup.send(SmartErrorMessages.permission_denied("approve loans", "Manager"))
                 return
 
             if approve:
                 if loan["treasury"] < loan["amount"]:
-                    await interaction.followup.send(f"❌ Company treasury insufficient. Has **${loan['treasury']:.2f}**, needs **${loan['amount']:.2f}**.")
+                    await interaction.followup.send(
+                        SmartErrorMessages.insufficient_treasury(loan["treasury"], loan["amount"], loan["name"]),
+                        ephemeral=True
+                    )
                     return
 
                 # Calculate due time
@@ -695,6 +758,15 @@ class CompanyCog(commands.Cog):
                 cursor.execute(
                     "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
                     (loan_amount, loan["company_id"])
+                )
+
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (loan["user_id"], "loan", loan_amount, f"Loan from {loan['name']}", loan["company_id"])
                 )
 
                 conn.commit()
@@ -758,7 +830,10 @@ class CompanyCog(commands.Cog):
                 loan = cursor.fetchone()
                 
                 if not loan:
-                    await interaction.followup.send(f"❌ Loan #{request_id} not found or you don't have permission.")
+                    await interaction.followup.send(
+                        SmartErrorMessages.loan_not_found(request_id),
+                        ephemeral=True
+                    )
                     return
 
                 embed = discord.Embed(
@@ -861,11 +936,17 @@ class CompanyCog(commands.Cog):
             loan = cursor.fetchone()
             
             if not loan:
-                await interaction.followup.send(f"❌ Loan #{request_id} not found or not yours.")
+                await interaction.followup.send(
+                    SmartErrorMessages.loan_not_found(request_id),
+                    ephemeral=True
+                )
                 return
 
             if loan["status"] != "APPROVED":
-                await interaction.followup.send(f"❌ Loan #{request_id} is not approved (status: {loan['status']}).")
+                await interaction.followup.send(
+                    f"❌ Loan #{request_id} is not approved (status: {loan['status']}).",
+                    ephemeral=True
+                )
                 return
 
             # Calculate total owed with interest
@@ -878,28 +959,52 @@ class CompanyCog(commands.Cog):
 
             if balance < total_owed:
                 await interaction.followup.send(
-                    f"❌ Insufficient funds! You have **${balance:.2f}**, need **${total_owed:.2f}** (including {loan['interest_rate']}% interest)."
+                    SmartErrorMessages.insufficient_funds(balance, total_owed, "repay_loan"),
+                    ephemeral=True
                 )
                 return
 
-            # Process repayment
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_owed, interaction.user.id))
-            cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?", (total_owed, loan["company_id"]))
-            cursor.execute(
-                """
-                INSERT INTO loan_payments (request_id, user_id, amount) VALUES (?, ?, ?)
-                """,
-                (request_id, interaction.user.id, total_owed)
-            )
-            cursor.execute(
-                "UPDATE loan_requests SET status = 'REPAID' WHERE request_id = ?",
-                (request_id,)
-            )
-            conn.commit()
+        # Show confirmation modal
+        async def execute_repayment(modal_interaction: discord.Interaction):
+            with get_db() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_owed, interaction.user.id))
+                cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?", (total_owed, loan["company_id"]))
+                cursor.execute(
+                    """
+                    INSERT INTO loan_payments (request_id, user_id, amount) VALUES (?, ?, ?)
+                    """,
+                    (request_id, interaction.user.id, total_owed)
+                )
+                cursor.execute(
+                    "UPDATE loan_requests SET status = 'REPAID' WHERE request_id = ?",
+                    (request_id,)
+                )
+                
+                # Log transaction
+                cursor.execute(
+                    """
+                    INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (interaction.user.id, "repay_loan", -total_owed, f"Loan repayment to {loan['company_name']}", loan["company_id"])
+                )
+                conn.commit()
 
-        await interaction.followup.send(
-            f"✅ Loan #{request_id} repaid! Paid **${total_owed:.2f}** to **{loan['company_name']}** (including {loan['interest_rate']}% interest)."
+            await modal_interaction.response.send_message(
+                f"✅ Loan #{request_id} repaid! Paid **${total_owed:.2f}** to **{loan['company_name']}** (including {loan['interest_rate']}% interest).",
+                ephemeral=True
+            )
+
+        modal = ConfirmLoanRepaymentModal(
+            request_id,
+            loan["amount"],
+            loan["company_name"],
+            total_owed,
+            execute_repayment
         )
+        await interaction.followup.send_modal(modal)
 
     @app_commands.command(
         name="delete_company",
@@ -925,7 +1030,10 @@ class CompanyCog(commands.Cog):
             company = cursor.fetchone()
             
             if not company:
-                await interaction.followup.send(f"❌ Company `{clean_id}` not found.")
+                await interaction.followup.send(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
                 return
 
             is_admin = interaction.user.guild_permissions.administrator
@@ -1093,7 +1201,10 @@ class CompanyCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         if amount <= 0:
-            await interaction.followup.send("❌ Amount must be greater than zero.")
+            await interaction.followup.send(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
 
         with get_db() as conn:
@@ -1113,7 +1224,10 @@ class CompanyCog(commands.Cog):
                 return
 
             if balance < amount:
-                await interaction.followup.send(f"❌ Insufficient funds! Balance: **${balance:.2f}**.")
+                await interaction.followup.send(
+                    SmartErrorMessages.insufficient_funds(balance, amount, "pay_debt"),
+                    ephemeral=True
+                )
                 return
 
             # Pay toward debt
@@ -1121,6 +1235,15 @@ class CompanyCog(commands.Cog):
             cursor.execute(
                 "UPDATE users SET balance = balance - ?, debt = debt - ? WHERE user_id = ?",
                 (payment, payment, interaction.user.id)
+            )
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "pay_debt", -payment, "Debt payment", None)
             )
             conn.commit()
 

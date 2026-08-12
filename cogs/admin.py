@@ -6,6 +6,7 @@ from discord.ext import commands
 from database import get_db
 from views import SetupView
 from safety import safety_wrapper, financial_safety, InputValidator, SAFETY_CONFIG
+from utils.errors import SmartErrorMessages
 
 
 class AdminCog(commands.Cog):
@@ -287,7 +288,8 @@ class AdminCog(commands.Cog):
                 )
             except sqlite3.IntegrityError:
                 await interaction.followup.send(
-                    f"❌ Entity ID `{clean_party_id}` already exists.", ephemeral=True
+                    SmartErrorMessages.already_exists(clean_party_id, "Party"),
+                    ephemeral=True
                 )
 
     @app_commands.command(
@@ -341,7 +343,8 @@ class AdminCog(commands.Cog):
 
             if not party:
                 await interaction.followup.send(
-                    f"❌ Party `{clean_party_id}` not found."
+                    SmartErrorMessages.party_not_found(clean_party_id),
+                    ephemeral=True
                 )
                 return
 
@@ -353,7 +356,8 @@ class AdminCog(commands.Cog):
 
             if not (is_admin or is_manager):
                 await interaction.followup.send(
-                    "❌ You do not have permission to manage this party."
+                    SmartErrorMessages.permission_denied("manage this party"),
+                    ephemeral=True
                 )
                 return
 
@@ -449,7 +453,10 @@ class AdminCog(commands.Cog):
         # Safety: Validate amount
         valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
         if not valid:
-            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+            await interaction.response.send_message(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
             return
         
         with get_db() as conn:
@@ -460,6 +467,15 @@ class AdminCog(commands.Cog):
                 ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
             """,
                 (target.id, amount, amount),
+            )
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (target.id, "admin_add_balance", amount, "Admin added balance", None)
             )
             conn.commit()
         await interaction.response.send_message(

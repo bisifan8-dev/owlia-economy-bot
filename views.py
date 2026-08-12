@@ -297,6 +297,15 @@ class BuyFromBotView(discord.ui.View):
             """,
                 (interaction.user.id, self.party_id, self.shares, self.shares),
             )
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "buy", -total_cost, f"Purchased {self.shares:.2f} shares from bot", self.party_id)
+            )
             conn.commit()
 
         button.disabled = True
@@ -889,3 +898,142 @@ class CounterSelect(discord.ui.Select):
         )
         if interaction.guild_id:
             await self.refresh_callback(interaction.guild_id)
+
+
+class HistoryView(discord.ui.View):
+    """Pagination view for transaction history."""
+    
+    def __init__(self, transactions, current_page: int, total_pages: int, total_count: int, bot):
+        super().__init__(timeout=120)
+        self.transactions = transactions
+        self.current_page = current_page
+        self.total_pages = total_pages
+        self.total_count = total_count
+        self.bot = bot
+        
+    def get_embed(self) -> discord.Embed:
+        """Generate the embed for the current page."""
+        embed = discord.Embed(
+            title="📜 Transaction History",
+            description=f"Showing page {self.current_page} of {self.total_pages} ({self.total_count} total transactions)",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        if not self.transactions:
+            embed.add_field(
+                name="No Transactions",
+                value="No transactions on this page.",
+                inline=False
+            )
+            return embed
+        
+        for tx in self.transactions:
+            # Determine emoji based on transaction type
+            emoji_map = {
+                "pay": "💸",
+                "buy": "📈",
+                "sell": "📉",
+                "invest": "🏦",
+                "treasury_spend": "🏛️",
+                "party_bid": "⚔️",
+                "paid_message": "💬",
+                "loan": "💳",
+                "repay_loan": "💰",
+                "pay_debt": "💵",
+                "admin_add_balance": "🛠️"
+            }
+            emoji = emoji_map.get(tx["transaction_type"], "📊")
+            
+            # Format amount with sign
+            amount = tx["amount"]
+            sign = "+" if amount > 0 else ""
+            amount_str = f"{sign}${amount:.2f}" if amount != 0 else "$0.00"
+            
+            # Parse timestamp
+            try:
+                ts = datetime.datetime.strptime(tx["timestamp"], "%Y-%m-%d %H:%M:%S")
+                time_str = f"<t:{int(ts.timestamp())}:R>"
+            except:
+                time_str = "Unknown time"
+            
+            # Build description
+            desc = tx["description"] or tx["transaction_type"]
+            if tx["party_id"]:
+                desc += f" (ID: {tx['party_id']})"
+            
+            embed.add_field(
+                name=f"{emoji} {tx['transaction_type'].title().replace('_', ' ')}",
+                value=f"{desc}\n**Amount:** {amount_str} • **{time_str}**",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Page {self.current_page} of {self.total_pages}")
+        return embed
+    
+    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page."""
+        if self.current_page <= 1:
+            await interaction.response.send_message("You're already on the first page.", ephemeral=True)
+            return
+        
+        self.current_page -= 1
+        await self._refresh(interaction)
+    
+    @discord.ui.button(label="▶️ Next", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page."""
+        if self.current_page >= self.total_pages:
+            await interaction.response.send_message("You're already on the last page.", ephemeral=True)
+            return
+        
+        self.current_page += 1
+        await self._refresh(interaction)
+    
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary, row=0)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Refresh the current page."""
+        await self._refresh(interaction)
+    
+    async def _refresh(self, interaction: discord.Interaction):
+        """Refresh the view with new data."""
+        await interaction.response.defer()
+        
+        per_page = 5
+        offset = (self.current_page - 1) * per_page
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT log_id, transaction_type, amount, description, party_id, timestamp
+                FROM transaction_log 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+                """,
+                (interaction.user.id, per_page, offset)
+            )
+            self.transactions = cursor.fetchall()
+            
+            # Update total count
+            cursor.execute(
+                "SELECT COUNT(*) as total FROM transaction_log WHERE user_id = ?",
+                (interaction.user.id,)
+            )
+            total_row = cursor.fetchone()
+            self.total_count = total_row["total"] if total_row else 0
+            self.total_pages = (self.total_count + per_page - 1) // per_page
+        
+        embed = self.get_embed()
+        await interaction.edit_original_response(embed=embed, view=self)
+    
+    async def on_timeout(self):
+        """Disable buttons when view times out."""
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except:
+            pass
