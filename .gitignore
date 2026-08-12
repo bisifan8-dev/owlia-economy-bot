@@ -1,0 +1,261 @@
+# ============================================
+# Python Environment & Cache
+# ============================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+pythonenv*
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================
+# Database Files (CRITICAL - DO NOT TRACK!)
+# ============================================
+
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+server_economy.db
+server_economy.db-journal
+database_backup_*.db
+
+# ============================================
+# Environment & Secrets
+# ============================================
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# API keys, tokens, secrets
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+tokens.json
+config.json
+
+# ============================================
+# Discord Bot Specific
+# ============================================
+
+# Bot session data
+session.dat
+bot.session
+*.session
+
+# ============================================
+# IDE / Editor Files
+# ============================================
+
+# VS Code
+.vscode/
+*.code-workspace
+.codebuddy/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+.sublime/
+
+# Vim
+*.swp
+*.swo
+*~
+.~*
+.*.swp
+
+# EMACS
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ============================================
+# OS Specific Files
+# ============================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+
+# Linux
+.directory
+*.bak
+*.tmp
+
+# ============================================
+# Testing & Coverage
+# ============================================
+
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+pyrightconfig.json
+*.cover
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+
+# ============================================
+# Logs & Temporary Files
+# ============================================
+
+logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+*.gz
+*.zip
+*.tar
+*.tar.gz
+temp/
+tmp/
+*.tmp
+*.temp
+
+# ============================================
+# Documentation & Assets
+# ============================================
+
+# Avoid tracking large assets
+*.mp4
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.psd
+*.tiff
+*.webp
+*.gif
+!screenshots/README.md
+
+# Generated documentation
+docs/_build/
+site/
+
+# ============================================
+# Docker & Container
+# ============================================
+
+.dockerignore
+Dockerfile
+docker-compose*.yml
+docker-compose*.yaml
+*.container
+*.image
+
+# ============================================
+# Deployment & Build
+# ============================================
+
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+
+# ============================================
+# Project Specific
+# ============================================
+
+# Matplotlib cache
+matplotlibrc
+*.png
+*.jpg
+*.jpeg
+!screenshots/*.png
+
+# Stock chart temporary files
+stock_chart.png
+chart_*.png
+
+# Backup files
+backup_*.py
+*.backup
+*.orig
+
+# ============================================
+# Security & Privacy
+# ============================================
+
+# User data exports
+user_data_*.json
+export_*.csv
+*.pkl
+
+# Keep this file
+!.gitkeep
