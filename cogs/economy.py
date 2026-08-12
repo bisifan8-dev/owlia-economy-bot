@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -487,6 +488,250 @@ class EconomyCog(commands.Cog):
         await interaction.followup.send(
             "✅ Paid message posted successfully ($1.00 deducted)!"
         )
+
+    @app_commands.command(
+        name="info",
+        description="📊 View your portfolio, net worth, and balance information."
+    )
+    @app_commands.describe(
+        user="Optional: View another user's info (defaults to yourself)"
+    )
+    @safety_wrapper("default")
+    async def info(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User = None
+    ):
+        """Display comprehensive user financial information."""
+        await interaction.response.defer(ephemeral=True)
+        
+        target_user = user or interaction.user
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Get user balance and debt
+            cursor.execute(
+                "SELECT balance, debt, message_count FROM users WHERE user_id = ?",
+                (target_user.id,)
+            )
+            user_data = cursor.fetchone()
+            
+            if not user_data:
+                if target_user.id == interaction.user.id:
+                    await interaction.followup.send(
+                        "❌ You don't have any financial data yet. Start by sending messages in designated channels!"
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"❌ {target_user.display_name} doesn't have any financial data yet."
+                    )
+                return
+            
+            balance = user_data["balance"] or 0.0
+            debt = user_data["debt"] or 0.0
+            message_count = user_data["message_count"] or 0
+            
+            # Get all shares the user owns
+            cursor.execute(
+                """
+                SELECT s.party_id, s.shares_owned, p.name, p.treasury, p.total_shares, p.is_company
+                FROM shares s
+                JOIN parties p ON s.party_id = p.party_id
+                WHERE s.user_id = ? AND s.shares_owned > 0
+                ORDER BY (p.treasury / p.total_shares) * s.shares_owned DESC
+                """,
+                (target_user.id,)
+            )
+            holdings = cursor.fetchall()
+            
+            # Calculate total stock value
+            total_stock_value = 0.0
+            for h in holdings:
+                price = h["treasury"] / h["total_shares"] if h["total_shares"] > 0 else 0.0
+                total_stock_value += price * h["shares_owned"]
+            
+            # Get total shares of each company for percentage calculation
+            company_totals = {}
+            for h in holdings:
+                cursor.execute(
+                    "SELECT SUM(shares_owned) as total FROM shares WHERE party_id = ?",
+                    (h["party_id"],)
+                )
+                total_row = cursor.fetchone()
+                company_totals[h["party_id"]] = total_row["total"] if total_row else 0.0
+            
+            # Get user's roles for party membership
+            member = interaction.guild.get_member(target_user.id)
+            user_roles = {str(r.id) for r in member.roles} if member else set()
+            
+            # Check if user is in any parties
+            cursor.execute(
+                """
+                SELECT party_id, name, role_id FROM parties 
+                WHERE is_company = 0 AND role_id IS NOT NULL
+                """
+            )
+            all_parties = cursor.fetchall()
+            user_parties = []
+            for p in all_parties:
+                if p["role_id"] in user_roles:
+                    user_parties.append(p)
+            
+            # Get active loans
+            cursor.execute(
+                """
+                SELECT request_id, company_id, amount, interest_rate, status, due_time
+                FROM loan_requests
+                WHERE user_id = ? AND status IN ('PENDING', 'APPROVED')
+                ORDER BY request_time DESC
+                """,
+                (target_user.id,)
+            )
+            loans = cursor.fetchall()
+            
+            # Get pending loan requests (as borrower)
+            cursor.execute(
+                """
+                SELECT request_id, company_id, amount, interest_rate, status
+                FROM loan_requests
+                WHERE user_id = ? AND status = 'PENDING'
+                """,
+                (target_user.id,)
+            )
+            pending_loans = cursor.fetchall()
+        
+        # Calculate net worth
+        net_worth = balance + total_stock_value - debt
+        
+        # Build the embed
+        is_self = target_user.id == interaction.user.id
+        title = f"📊 {target_user.display_name}'s Portfolio" if not is_self else "📊 Your Portfolio"
+        
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.green() if net_worth >= 0 else discord.Color.red(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        # Add user avatar if available
+        if target_user.avatar:
+            embed.set_thumbnail(url=target_user.avatar.url)
+        
+        # Financial Summary
+        embed.add_field(
+            name="💰 Financial Summary",
+            value=(
+                f"**Balance:** ${balance:.2f}\n"
+                f"**Stock Value:** ${total_stock_value:.2f}\n"
+                f"**Debt:** ${debt:.2f}\n"
+                f"**Net Worth:** **${net_worth:.2f}**"
+            ),
+            inline=False
+        )
+        
+        # Message Progress
+        remaining = max(0, 50 - message_count)
+        embed.add_field(
+            name="💬 Message Progress",
+            value=f"**{message_count}/50** messages\n*(**{remaining}** more until next $1.00 payout)*",
+            inline=True
+        )
+        
+        # Party Membership
+        if user_parties:
+            party_names = ", ".join([f"**{p['name']}**" for p in user_parties])
+            embed.add_field(
+                name="🏛️ Party Membership",
+                value=party_names,
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="🏛️ Party Membership",
+                value="*No party membership*",
+                inline=True
+            )
+        
+        # Stock Holdings
+        if holdings:
+            holdings_text = ""
+            total_shares_owned = 0
+            for h in holdings:
+                price = h["treasury"] / h["total_shares"] if h["total_shares"] > 0 else 0.0
+                value = price * h["shares_owned"]
+                total_shares_owned += h["shares_owned"]
+                
+                # Calculate ownership percentage
+                total_company_shares = company_totals.get(h["party_id"], 1.0)
+                pct = (h["shares_owned"] / total_company_shares * 100) if total_company_shares > 0 else 0
+                
+                tag = "🏬" if h["is_company"] else "🏢"
+                holdings_text += f"{tag} **{h['name']}**: {h['shares_owned']:.2f} shares (${value:.2f}) - {pct:.1f}% of company\n"
+            
+            # Truncate if too long
+            if len(holdings_text) > 1000:
+                holdings_text = holdings_text[:997] + "..."
+            
+            embed.add_field(
+                name=f"📈 Stock Holdings ({len(holdings)} entities)",
+                value=holdings_text,
+                inline=False
+            )
+            
+            embed.add_field(
+                name="📊 Total Shares Owned",
+                value=f"{total_shares_owned:.2f} shares",
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="📈 Stock Holdings",
+                value="*No stock holdings*",
+                inline=False
+            )
+        
+        # Loans
+        if loans or pending_loans:
+            loan_text = ""
+            for l in loans:
+                status_emoji = {
+                    "PENDING": "⏳",
+                    "APPROVED": "✅",
+                    "REJECTED": "❌",
+                    "REPAID": "💚",
+                    "DEFAULTED": "💀"
+                }.get(l["status"], "❓")
+                
+                total_owed = l["amount"] + (l["amount"] * l["interest_rate"] / 100)
+                loan_text += f"{status_emoji} ${l['amount']:.2f} from **{l['company_id']}** (Owes: ${total_owed:.2f})"
+                if l["status"] == "APPROVED" and l["due_time"]:
+                    due = datetime.datetime.strptime(l["due_time"], "%Y-%m-%d %H:%M:%S")
+                    loan_text += f" - Due <t:{int(due.timestamp())}:R>"
+                loan_text += "\n"
+            
+            if loan_text:
+                embed.add_field(
+                    name="💳 Loans",
+                    value=loan_text,
+                    inline=False
+                )
+        
+        # Debt warning
+        if debt > 0:
+            embed.add_field(
+                name="⚠️ Debt Warning",
+                value=f"You have **${debt:.2f}** in debt! Use `/manage_debt` to view and pay off your debt.",
+                inline=False
+            )
+        
+        # Footer with timestamp
+        embed.set_footer(
+            text=f"Requested by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.followup.send(embed=embed)
 
 
 async def setup(bot):

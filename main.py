@@ -21,7 +21,7 @@ class EconomyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.MARKET_CHANNELS = {}
         self.ACTIVE_BIDS = {}
-        self.GUILD_ID = 1444601731014070272
+        self.GUILD_ID = 1533217862100062238
 
     def load_market_channels(self):
         with get_db() as conn:
