@@ -55,13 +55,51 @@ class AdminCog(commands.Cog):
                 )
                 existing_cfg = cursor.fetchone()
 
-            # Check existing channels
-            board_chan = guild.get_channel(existing_cfg["board_channel_id"]) if existing_cfg else None
-            buy_chan = guild.get_channel(existing_cfg["buy_channel_id"]) if existing_cfg else None
-            sell_chan = guild.get_channel(existing_cfg["sell_channel_id"]) if existing_cfg else None
-            bids_chan = guild.get_channel(existing_cfg["bids_channel_id"]) if existing_cfg else None
-            loans_chan = guild.get_channel(existing_cfg["loans_channel_id"]) if existing_cfg and existing_cfg.get("loans_channel_id") else None
-            p_chan = guild.get_channel(existing_cfg["paid_channel_id"]) if existing_cfg else None
+            # Check existing channels - using direct index access for sqlite3.Row
+            board_chan = None
+            buy_chan = None
+            sell_chan = None
+            bids_chan = None
+            loans_chan = None
+            p_chan = None
+
+            if existing_cfg:
+                # Check if each column exists and has a value
+                try:
+                    if existing_cfg["board_channel_id"]:
+                        board_chan = guild.get_channel(existing_cfg["board_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+                
+                try:
+                    if existing_cfg["buy_channel_id"]:
+                        buy_chan = guild.get_channel(existing_cfg["buy_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+                
+                try:
+                    if existing_cfg["sell_channel_id"]:
+                        sell_chan = guild.get_channel(existing_cfg["sell_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+                
+                try:
+                    if existing_cfg["bids_channel_id"]:
+                        bids_chan = guild.get_channel(existing_cfg["bids_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+                
+                try:
+                    if existing_cfg["loans_channel_id"]:
+                        loans_chan = guild.get_channel(existing_cfg["loans_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+                
+                try:
+                    if existing_cfg["paid_channel_id"]:
+                        p_chan = guild.get_channel(existing_cfg["paid_channel_id"])
+                except (KeyError, IndexError, TypeError):
+                    pass
 
             category = None
             if not all([board_chan, buy_chan, sell_chan, bids_chan]):
@@ -111,8 +149,32 @@ class AdminCog(commands.Cog):
                     "All administrative and financial actions will be logged here for security purposes."
                 )
 
+            # Get existing message IDs if available
+            board_msg_id = None
+            buy_msg_id = None
+            sell_msg_id = None
+            loans_msg_id = None
+
+            if existing_cfg:
+                try:
+                    board_msg_id = existing_cfg["board_msg_id"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+                try:
+                    buy_msg_id = existing_cfg["buy_msg_id"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+                try:
+                    sell_msg_id = existing_cfg["sell_msg_id"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+                try:
+                    loans_msg_id = existing_cfg["loans_msg_id"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+
             # Only send initial messages if channels were just created
-            if not existing_cfg or not existing_cfg.get("board_msg_id"):
+            if not existing_cfg or not board_msg_id:
                 init_board = await board_chan.send("📊 **Initializing Live Stock Board...**")
                 init_buy = await buy_chan.send("📈 **Initializing Buy Market...**")
                 init_sell = await sell_chan.send("📉 **Initializing Sell Market...**")
@@ -120,22 +182,22 @@ class AdminCog(commands.Cog):
             else:
                 # Try to find existing messages
                 try:
-                    init_board = await board_chan.fetch_message(existing_cfg["board_msg_id"])
+                    init_board = await board_chan.fetch_message(board_msg_id)
                 except:
                     init_board = await board_chan.send("📊 **Initializing Live Stock Board...**")
                 
                 try:
-                    init_buy = await buy_chan.fetch_message(existing_cfg["buy_msg_id"])
+                    init_buy = await buy_chan.fetch_message(buy_msg_id)
                 except:
                     init_buy = await buy_chan.send("📈 **Initializing Buy Market...**")
                 
                 try:
-                    init_sell = await sell_chan.fetch_message(existing_cfg["sell_msg_id"])
+                    init_sell = await sell_chan.fetch_message(sell_msg_id)
                 except:
                     init_sell = await sell_chan.send("📉 **Initializing Sell Market...**")
                 
                 try:
-                    init_loans = await loans_chan.fetch_message(existing_cfg["loans_msg_id"])
+                    init_loans = await loans_chan.fetch_message(loans_msg_id)
                 except:
                     init_loans = await loans_chan.send("💳 **Loan Requests**\nUse `/request_loan` to request a loan from a company.")
 
