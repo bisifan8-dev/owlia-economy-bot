@@ -406,4 +406,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 </div>
 
-You can now copy this entire content and replace your existing `README.md` file with it. The bot invite link includes `permissions=8` (Administrator), so users will be able to grant all necessary permissions in one click.
+test
