@@ -402,4 +402,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 [Report Bug](https://github.com/yourusername/owlia-economy-bot/issues) · [Request Feature](https://github.com/yourusername/owlia-economy-bot/issues)
 
-</div>
+</div># owlia-economy-bot
