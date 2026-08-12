@@ -14,17 +14,26 @@ class ConfirmTransactionModal(discord.ui.Modal, title="Confirm Transaction"):
         self.callback = callback
         self.command_name = command_name or action
         
-    confirm = discord.ui.TextInput(
-        label=f"Type 'CONFIRM' to proceed",
-        placeholder="Type CONFIRM here...",
-        required=True,
-        min_length=6,
-        max_length=7,
-        style=discord.TextStyle.short
-    )
+        # Add the confirm field
+        self.add_item(discord.ui.TextInput(
+            label=f"Type 'CONFIRM' to proceed",
+            placeholder="Type CONFIRM here...",
+            required=True,
+            min_length=6,
+            max_length=7,
+            style=discord.TextStyle.short,
+            custom_id="confirm_input"
+        ))
     
     async def on_submit(self, interaction: discord.Interaction):
-        if self.confirm.value.upper() != "CONFIRM":
+        # Get the value from the children
+        confirm_input = None
+        for child in self.children:
+            if child.custom_id == "confirm_input":
+                confirm_input = child
+                break
+        
+        if not confirm_input or confirm_input.value.upper() != "CONFIRM":
             await interaction.response.send_message(
                 "❌ Transaction cancelled. You must type 'CONFIRM' exactly.",
                 ephemeral=True
@@ -50,19 +59,26 @@ class ConfirmPurchaseModal(discord.ui.Modal, title="Confirm Purchase"):
         self.price = price
         self.total_cost = total_cost
         self.callback = callback
-        # Set label dynamically in __init__
-        self.confirm.label = f"Type 'CONFIRM' to buy {shares:.2f} shares"
         
-    confirm = discord.ui.TextInput(
-        placeholder="Type CONFIRM here...",
-        required=True,
-        min_length=6,
-        max_length=7,
-        style=discord.TextStyle.short
-    )
+        # Add the confirm field with dynamic label
+        self.add_item(discord.ui.TextInput(
+            label=f"Type 'CONFIRM' to buy {shares:.2f} shares",
+            placeholder="Type CONFIRM here...",
+            required=True,
+            min_length=6,
+            max_length=7,
+            style=discord.TextStyle.short,
+            custom_id="confirm_input"
+        ))
     
     async def on_submit(self, interaction: discord.Interaction):
-        if self.confirm.value.upper() != "CONFIRM":
+        confirm_input = None
+        for child in self.children:
+            if child.custom_id == "confirm_input":
+                confirm_input = child
+                break
+        
+        if not confirm_input or confirm_input.value.upper() != "CONFIRM":
             await interaction.response.send_message(
                 "❌ Purchase cancelled. You must type 'CONFIRM' exactly.",
                 ephemeral=True
@@ -82,19 +98,26 @@ class ConfirmSellModal(discord.ui.Modal, title="Confirm Sale"):
         self.price = price
         self.total_value = total_value
         self.callback = callback
-        # Set label dynamically in __init__
-        self.confirm.label = f"Type 'CONFIRM' to sell {shares:.2f} shares"
         
-    confirm = discord.ui.TextInput(
-        placeholder="Type CONFIRM here...",
-        required=True,
-        min_length=6,
-        max_length=7,
-        style=discord.TextStyle.short
-    )
+        # Add the confirm field with dynamic label
+        self.add_item(discord.ui.TextInput(
+            label=f"Type 'CONFIRM' to sell {shares:.2f} shares",
+            placeholder="Type CONFIRM here...",
+            required=True,
+            min_length=6,
+            max_length=7,
+            style=discord.TextStyle.short,
+            custom_id="confirm_input"
+        ))
     
     async def on_submit(self, interaction: discord.Interaction):
-        if self.confirm.value.upper() != "CONFIRM":
+        confirm_input = None
+        for child in self.children:
+            if child.custom_id == "confirm_input":
+                confirm_input = child
+                break
+        
+        if not confirm_input or confirm_input.value.upper() != "CONFIRM":
             await interaction.response.send_message(
                 "❌ Sale cancelled. You must type 'CONFIRM' exactly.",
                 ephemeral=True
@@ -114,19 +137,26 @@ class ConfirmLoanRepaymentModal(discord.ui.Modal, title="Confirm Loan Repayment"
         self.company_name = company_name
         self.total_owed = total_owed
         self.callback = callback
-        # Set label dynamically in __init__
-        self.confirm.label = f"Type 'CONFIRM' to repay ${total_owed:.2f}"
         
-    confirm = discord.ui.TextInput(
-        placeholder="Type CONFIRM here...",
-        required=True,
-        min_length=6,
-        max_length=7,
-        style=discord.TextStyle.short
-    )
+        # Add the confirm field with dynamic label
+        self.add_item(discord.ui.TextInput(
+            label=f"Type 'CONFIRM' to repay ${total_owed:.2f}",
+            placeholder="Type CONFIRM here...",
+            required=True,
+            min_length=6,
+            max_length=7,
+            style=discord.TextStyle.short,
+            custom_id="confirm_input"
+        ))
     
     async def on_submit(self, interaction: discord.Interaction):
-        if self.confirm.value.upper() != "CONFIRM":
+        confirm_input = None
+        for child in self.children:
+            if child.custom_id == "confirm_input":
+                confirm_input = child
+                break
+        
+        if not confirm_input or confirm_input.value.upper() != "CONFIRM":
             await interaction.response.send_message(
                 "❌ Repayment cancelled. You must type 'CONFIRM' exactly.",
                 ephemeral=True

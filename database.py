@@ -221,6 +221,7 @@ def init_db():
         """
         )
 
+        # Create transaction_log with all columns from the start
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS transaction_log (

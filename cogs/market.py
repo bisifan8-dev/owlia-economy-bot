@@ -29,10 +29,10 @@ class MarketCog(commands.Cog):
         use_suggested: str,
         price_per_share: float = 0.0,
     ):
-        await interaction.response.defer(ephemeral=True)
+        # Do NOT defer here - modals require interaction.response
         guild_id = interaction.guild_id
         if shares <= 0:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 SmartErrorMessages.invalid_amount(shares, 0.01, 1000000.0),
                 ephemeral=True
             )
@@ -50,7 +50,7 @@ class MarketCog(commands.Cog):
             party = cursor.fetchone()
 
             if not party:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.party_not_found(clean_party_id),
                     ephemeral=True
                 )
@@ -82,7 +82,7 @@ class MarketCog(commands.Cog):
                     interaction.user.id,
                     self.bot.refresh_market_embeds,
                 )
-                await interaction.followup.send(embed=embed, view=view)
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
                 return
 
             actual_price = (
@@ -92,8 +92,9 @@ class MarketCog(commands.Cog):
             )
 
             if not party["is_company"] and human_shares == 0 and actual_price != standard_cost:
-                await interaction.followup.send(
-                    f"❌ AI-managed party. Must buy at standard cost (`${standard_cost:.2f}`) with use_suggested=Y."
+                await interaction.response.send_message(
+                    f"❌ AI-managed party. Must buy at standard cost (`${standard_cost:.2f}`) with use_suggested=Y.",
+                    ephemeral=True
                 )
                 return
 
@@ -106,7 +107,7 @@ class MarketCog(commands.Cog):
             user_bal = user_row["balance"] if user_row else 0.0
 
             if user_bal < total_cost:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.insufficient_funds(user_bal, total_cost, "buy"),
                     ephemeral=True
                 )
@@ -153,7 +154,7 @@ class MarketCog(commands.Cog):
                     total_cost,
                     execute_direct_purchase
                 )
-                await interaction.followup.send_modal(modal)
+                await interaction.response.send_modal(modal)
                 return
 
             # Show confirmation for market order
@@ -196,7 +197,7 @@ class MarketCog(commands.Cog):
                 total_cost,
                 execute_market_order
             )
-            await interaction.followup.send_modal(modal)
+            await interaction.response.send_modal(modal)
 
     @app_commands.command(
         name="sell", description="Create a sell order for shares you own."
@@ -213,10 +214,10 @@ class MarketCog(commands.Cog):
         shares: float,
         price_per_share: float,
     ):
-        await interaction.response.defer(ephemeral=True)
+        # Do NOT defer here - modals require interaction.response
         guild_id = interaction.guild_id
         if shares <= 0 or price_per_share <= 0:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 SmartErrorMessages.invalid_amount(shares if shares <= 0 else price_per_share, 0.01, 1000000.0),
                 ephemeral=True
             )
@@ -232,7 +233,7 @@ class MarketCog(commands.Cog):
             party = cursor.fetchone()
 
             if not party:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.party_not_found(clean_party_id),
                     ephemeral=True
                 )
@@ -246,7 +247,7 @@ class MarketCog(commands.Cog):
             owned = share_row["shares_owned"] if share_row else 0.0
 
             if owned < shares:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.insufficient_shares(owned, shares, party['name']),
                     ephemeral=True
                 )
@@ -294,7 +295,7 @@ class MarketCog(commands.Cog):
             total_value,
             execute_sell
         )
-        await interaction.followup.send_modal(modal)
+        await interaction.response.send_modal(modal)
 
     @app_commands.command(
         name="manage_stock",
