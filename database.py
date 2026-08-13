@@ -1,3 +1,5 @@
+# database.py - Full file with shout additions
+
 import sqlite3
 import datetime
 
@@ -28,7 +30,8 @@ def init_db():
                 paid_channel_id INTEGER,
                 bids_channel_id INTEGER,
                 loans_channel_id INTEGER,
-                loans_msg_id INTEGER
+                loans_msg_id INTEGER,
+                audit_channel_id INTEGER
             )
         """
         )
@@ -236,6 +239,64 @@ def init_db():
         """
         )
 
+        # ─── SHOUT SYSTEM TABLES ──────────────────────────────────────────────
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shout_log (
+                shout_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                guild_id INTEGER,
+                message TEXT,
+                cost REAL DEFAULT 500.0,
+                total_targeted INTEGER DEFAULT 0,
+                total_sent INTEGER DEFAULT 0,
+                total_failed INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                cooldown_until TIMESTAMP,
+                strike_window_end TIMESTAMP,
+                strike_reason TEXT,
+                struck_by INTEGER,
+                include_bots INTEGER DEFAULT 0
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shout_messages (
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shout_id INTEGER,
+                user_id INTEGER,
+                status TEXT DEFAULT 'SENT',
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(shout_id) REFERENCES shout_log(shout_id) ON DELETE CASCADE
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shout_blacklist (
+                user_id INTEGER PRIMARY KEY,
+                opted_out_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                refund_amount REAL DEFAULT 20.0
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shout_cooldowns (
+                user_id INTEGER PRIMARY KEY,
+                last_shout_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
+        # ─── SCHEMA MIGRATION CHECKS ──────────────────────────────────────────
+
         # Schema Migration Checks - Parties Table
         cursor.execute("PRAGMA table_info(parties)")
         columns = [col["name"] for col in cursor.fetchall()]
@@ -303,6 +364,15 @@ def init_db():
             cursor.execute(
                 "ALTER TABLE board_votes ADD COLUMN company_id TEXT"
             )
+
+        # Schema Migration Checks - Shout Tables (ensure all columns exist)
+        # This is for safety in case the tables already existed with different schemas
+        cursor.execute("PRAGMA table_info(shout_log)")
+        shout_cols = [col["name"] for col in cursor.fetchall()]
+        if "completed_at" not in shout_cols:
+            cursor.execute("ALTER TABLE shout_log ADD COLUMN completed_at TIMESTAMP")
+        if "cooldown_until" not in shout_cols:
+            cursor.execute("ALTER TABLE shout_log ADD COLUMN cooldown_until TIMESTAMP")
 
         cursor.execute(
             """

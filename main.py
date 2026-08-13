@@ -9,6 +9,7 @@ from aiohttp import web
 import json
 from datetime import datetime
 from safety import setup_safety, SAFETY_CONFIG
+from cogs.shout import ShoutCog
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -204,6 +205,7 @@ class EconomyBot(commands.Bot):
         await self.load_extension("cogs.market")
         await self.load_extension("cogs.economy")
         await self.load_extension("cogs.events")
+        await self.load_extension("cogs.shout")
 
         guild = discord.Object(id=self.GUILD_ID)
         self.tree.copy_global_to(guild=guild)

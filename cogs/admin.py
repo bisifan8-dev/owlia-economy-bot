@@ -544,6 +544,91 @@ class AdminCog(commands.Cog):
             f"✅ Added **${amount:.2f}** to {target.mention}.", ephemeral=True
         )
 
+    @app_commands.command(
+        name="remove_balance",
+        description="💸 Manually removes money from a user's balance.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @safety_wrapper("admin")
+    @financial_safety(required_balance=False)
+    async def remove_balance(
+        self, interaction: discord.Interaction, target: discord.User, amount: float
+    ):
+        """Remove money from a user's balance (cannot go below 0)."""
+        # Safety: Validate amount
+        valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
+        if not valid:
+            await interaction.response.send_message(
+                SmartErrorMessages.invalid_amount(amount),
+                ephemeral=True
+            )
+            return
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check current balance
+            cursor.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (target.id,)
+            )
+            row = cursor.fetchone()
+            current_balance = row["balance"] if row else 0.0
+            
+            if current_balance <= 0:
+                await interaction.response.send_message(
+                    f"ℹ️ {target.mention} already has **${current_balance:.2f}** (nothing to remove).",
+                    ephemeral=True
+                )
+                return
+            
+            # Determine actual amount to remove (can't go below 0)
+            remove_amount = min(amount, current_balance)
+            
+            # Update the balance
+            cursor.execute(
+                """
+                INSERT INTO users (user_id, balance, message_count, premium_credits) VALUES (?, 0, 0, 0)
+                ON CONFLICT(user_id) DO UPDATE SET balance = balance - ?
+                """,
+                (target.id, remove_amount)
+            )
+            
+            # Log the removal
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (target.id, "admin_remove_balance", -remove_amount, f"Admin removed balance (${remove_amount:.2f})", None)
+            )
+            
+            # Log admin action
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "admin_action", 0, f"Removed ${remove_amount:.2f} from {target.display_name}", None)
+            )
+            
+            conn.commit()
+        
+        new_balance = current_balance - remove_amount
+        
+        if amount > current_balance:
+            await interaction.response.send_message(
+                f"⚠️ Removed **${remove_amount:.2f}** from {target.mention} (attempted ${amount:.2f}, but balance was only ${current_balance:.2f}).\n"
+                f"💰 New balance: **${new_balance:.2f}**",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ Removed **${remove_amount:.2f}** from {target.mention}.\n"
+                f"💰 New balance: **${new_balance:.2f}**",
+                ephemeral=True
+            )
+
 
 async def setup(bot):
     await bot.add_cog(AdminCog(bot))
