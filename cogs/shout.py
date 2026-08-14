@@ -1,17 +1,15 @@
-# cogs/shout.py - Full file with strike system
-
 import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timedelta
-from database import get_db
+from database import get_db, get_user_managed_parties
 from safety import safety_wrapper, financial_safety, InputValidator
 from utils.errors import SmartErrorMessages
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 class ShoutCog(commands.Cog):
-    """Shout system with 5-hour admin strike window."""
+    """Shout system with 5-hour admin strike window and treasury support."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -23,10 +21,186 @@ class ShoutCog(commands.Cog):
         self.DM_RATE_LIMIT = 30
         self.PROGRESS_UPDATE_INTERVAL = 10
         self.strike_tasks: Dict[int, asyncio.Task] = {}
+        # Superuser ID that bypasses all restrictions
+        self.SUPERUSER_ID = 938992963403542580
+
+    def _get_user_managed_parties(self, user_id: int) -> List[Dict]:
+        """Get all parties/companies the user manages."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT p.party_id, p.name, p.manager_role_id, p.treasury, p.is_company, p.structure_type
+                FROM parties p
+                WHERE p.is_setup = 1
+            """)
+            all_parties = cursor.fetchall()
+        
+        managed = []
+        # Get user's roles
+        guild = None
+        for g in self.bot.guilds:
+            member = g.get_member(user_id)
+            if member:
+                guild = g
+                break
+        
+        if not guild:
+            return managed
+        
+        user_role_ids = {str(r.id) for r in guild.get_member(user_id).roles} if guild.get_member(user_id) else set()
+        is_admin = guild.get_member(user_id).guild_permissions.administrator if guild.get_member(user_id) else False
+        
+        for p in all_parties:
+            if is_admin:
+                managed.append(p)
+            elif p["manager_role_id"] and p["manager_role_id"] in user_role_ids:
+                managed.append(p)
+        
+        return managed
+
+    def _get_entity_by_id(self, party_id: str) -> Optional[Dict]:
+        """Get a single entity by ID."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT p.party_id, p.name, p.manager_role_id, p.treasury, p.is_company, p.structure_type
+                FROM parties p
+                WHERE p.party_id = ? AND p.is_setup = 1
+            """, (party_id,))
+            return cursor.fetchone()
+
+    async def _send_shout_as_entity(
+        self,
+        guild: discord.Guild,
+        shout_id: int,
+        message: str,
+        include_bots: bool,
+        sender: discord.User,
+        entity_name: str,
+        entity_id: str,
+        is_company: bool
+    ):
+        """Process a shout sent on behalf of an entity."""
+        try:
+            members = [m for m in guild.members if include_bots or not m.bot]
+            blacklisted = await self.get_blacklisted_users()
+            members = [m for m in members if m.id not in blacklisted]
+            
+            total_targeted = len(members)
+            
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE shout_log 
+                    SET total_targeted = ?, status = 'SENDING'
+                    WHERE shout_id = ?
+                """, (total_targeted, shout_id))
+                conn.commit()
+            
+            progress_channel = await self._get_progress_channel(guild)
+            progress_msg = None
+            if progress_channel:
+                embed = self.create_progress_embed(shout_id, 0, total_targeted, message)
+                progress_msg = await progress_channel.send(embed=embed)
+            
+            sent_count = 0
+            failed_count = 0
+            
+            # Determine entity type for display
+            entity_type = "🏬 Company" if is_company else "🏢 Party"
+            
+            for i, member in enumerate(members):
+                try:
+                    shout_message = (
+                        f"📢 **{entity_type} SHOUT #{shout_id}**\n"
+                        f"From: **{entity_name}** ({entity_id})\n"
+                        f"Sent by: {sender.display_name}\n"
+                        f"\n{message}\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔄 To opt out: `/shout_opt_out` (${self.OPT_OUT_COST:.2f})"
+                    )
+                    await member.send(shout_message)
+                    sent_count += 1
+                    
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT INTO shout_messages (shout_id, user_id, status)
+                            VALUES (?, ?, 'SENT')
+                        """, (shout_id, member.id))
+                        conn.commit()
+                    
+                except discord.Forbidden:
+                    failed_count += 1
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT INTO shout_messages (shout_id, user_id, status)
+                            VALUES (?, ?, 'FAILED')
+                        """, (shout_id, member.id))
+                        conn.commit()
+                    
+                except Exception:
+                    failed_count += 1
+                
+                if i % self.DM_RATE_LIMIT == 0 and i > 0:
+                    await asyncio.sleep(1)
+                
+                if i % self.PROGRESS_UPDATE_INTERVAL == 0 and progress_msg:
+                    embed = self.create_progress_embed(
+                        shout_id, 
+                        sent_count + failed_count, 
+                        total_targeted, 
+                        message,
+                        sent_count,
+                        failed_count
+                    )
+                    await progress_msg.edit(embed=embed)
+            
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE shout_log 
+                    SET total_sent = ?, total_failed = ?, status = 'COMPLETED', completed_at = ?
+                    WHERE shout_id = ?
+                """, (
+                    sent_count,
+                    failed_count,
+                    datetime.now().isoformat(),
+                    shout_id
+                ))
+                conn.commit()
+            
+            if progress_msg:
+                embed = self.create_progress_embed(
+                    shout_id,
+                    total_targeted,
+                    total_targeted,
+                    message,
+                    sent_count,
+                    failed_count,
+                    completed=True
+                )
+                await progress_msg.edit(embed=embed)
+            
+            self.active_shouts.pop(shout_id, None)
+            
+        except Exception as e:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE shout_log 
+                    SET status = 'FAILED', completed_at = ?
+                    WHERE shout_id = ?
+                """, (datetime.now().isoformat(), shout_id))
+                conn.commit()
+            
+            print(f"❌ Shout #{shout_id} failed: {e}")
+            self.active_shouts.pop(shout_id, None)
 
     @app_commands.command(
         name="shout",
-        description="📢 Propose a shout (5hr admin review before sending)"
+        description="📢 Propose a shout (personal funds, 5hr admin review)"
     )
     @app_commands.describe(
         message="The message you want to shout to everyone",
@@ -40,7 +214,7 @@ class ShoutCog(commands.Cog):
         message: str,
         include_bots: bool = False
     ):
-        """Propose a shout with a 5-hour admin review window."""
+        """Propose a shout with a 5-hour admin review window (personal funds)."""
         await interaction.response.defer(ephemeral=True)
         
         if len(message) > 2000:
@@ -50,14 +224,17 @@ class ShoutCog(commands.Cog):
             )
             return
         
-        if await self.is_user_blacklisted(interaction.user.id):
+        # Check if user is the superuser - bypass blacklist check
+        is_superuser = interaction.user.id == self.SUPERUSER_ID
+        if not is_superuser and await self.is_user_blacklisted(interaction.user.id):
             await interaction.followup.send(
                 "❌ You have opted out of shouts. Use `/shout_opt_in` to rejoin.",
                 ephemeral=True
             )
             return
         
-        if await self.is_on_cooldown(interaction.user.id):
+        # Superuser bypasses cooldown
+        if not is_superuser and await self.is_on_cooldown(interaction.user.id):
             remaining = await self.get_cooldown_remaining(interaction.user.id)
             await interaction.followup.send(
                 f"⏳ You're on cooldown! Try again in **{remaining}**.",
@@ -82,18 +259,27 @@ class ShoutCog(commands.Cog):
                 )
                 return
             
+            # For superuser, bypass the strike window entirely - post immediately
+            if is_superuser:
+                status = 'RUNNING'
+                strike_window_end = None
+            else:
+                status = 'PENDING_STRIKE'
+                strike_window_end = (datetime.now() + timedelta(hours=self.STRIKE_WINDOW_HOURS)).isoformat()
+            
             cursor.execute("""
                 INSERT INTO shout_log (
                     user_id, guild_id, message, cost, status, 
                     total_targeted, total_sent, total_failed,
-                    strike_window_end, include_bots
-                ) VALUES (?, ?, ?, ?, 'PENDING_STRIKE', 0, 0, 0, ?, ?)
+                    strike_window_end, include_bots, entity_id, entity_name, is_company_shout
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, NULL, NULL, 0)
             """, (
                 interaction.user.id,
                 interaction.guild_id,
                 message,
                 self.SHOUT_COST,
-                (datetime.now() + timedelta(hours=self.STRIKE_WINDOW_HOURS)).isoformat(),
+                status,
+                strike_window_end,
                 1 if include_bots else 0
             ))
             shout_id = cursor.lastrowid
@@ -109,62 +295,357 @@ class ShoutCog(commands.Cog):
             """, (
                 interaction.user.id,
                 -self.SHOUT_COST,
-                f"Shout #{shout_id} pending strike review: {message[:50]}...",
+                f"Personal Shout #{shout_id} {'immediate' if is_superuser else 'pending strike review'}: {message[:50]}...",
                 None
             ))
             
+            # Only set cooldown for non-superusers
+            if not is_superuser:
+                cursor.execute("""
+                    INSERT INTO shout_cooldowns (user_id, last_shout_at) VALUES (?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET last_shout_at = ?
+                """, (
+                    interaction.user.id,
+                    datetime.now().isoformat(),
+                    datetime.now().isoformat()
+                ))
+            conn.commit()
+        
+        audit_channel = await self._get_audit_channel(interaction.guild)
+        
+        if is_superuser:
+            # Superuser shout - execute immediately
+            await interaction.followup.send(
+                f"🚀 **Superuser Shout #{shout_id} is being sent!**\n"
+                f"📋 Message: {message[:100]}{'...' if len(message) > 100 else ''}",
+                ephemeral=True
+            )
+            
+            # Store in active shouts
+            self.active_shouts[shout_id] = {
+                "status": "RUNNING",
+                "user_id": interaction.user.id,
+                "message": message,
+                "include_bots": include_bots,
+                "guild": interaction.guild,
+                "is_superuser": True
+            }
+            
+            # Execute immediately
+            await self._execute_shout(shout_id, interaction.guild)
+            
+            # Log in audit channel
+            if audit_channel:
+                embed = discord.Embed(
+                    title=f"📢 **SUPERUSER SHOUT #{shout_id}**",
+                    description=f"**Proposed by:** {interaction.user.mention}\n"
+                               f"**Message:**\n```\n{message}\n```\n"
+                               f"**Cost:** ${self.SHOUT_COST:.2f}\n"
+                               f"**Includes Bots:** {'Yes' if include_bots else 'No'}\n\n"
+                               f"⚡ **IMMEDIATE EXECUTION** (Superuser bypass)",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now()
+                )
+                await audit_channel.send(embed=embed)
+        else:
+            # Normal user - pending strike window
+            if audit_channel:
+                embed = discord.Embed(
+                    title=f"📢 **PENDING SHOUT #{shout_id}**",
+                    description=f"**Proposed by:** {interaction.user.mention}\n"
+                               f"**Message:**\n```\n{message}\n```\n"
+                               f"**Cost:** ${self.SHOUT_COST:.2f}\n"
+                               f"**Includes Bots:** {'Yes' if include_bots else 'No'}\n\n"
+                               f"⏳ **Strike Window:** {self.STRIKE_WINDOW_HOURS} hours\n"
+                               f"**Expires:** <t:{int((datetime.now() + timedelta(hours=self.STRIKE_WINDOW_HOURS)).timestamp())}:R>",
+                    color=discord.Color.yellow(),
+                    timestamp=datetime.now()
+                )
+                embed.set_footer(text="Admins/Mods: Click Strike to cancel this shout and refund the user")
+                
+                view = StrikeView(shout_id, self.bot)
+                strike_msg = await audit_channel.send(embed=embed, view=view)
+                
+                self.active_shouts[shout_id] = {
+                    "status": "PENDING_STRIKE",
+                    "user_id": interaction.user.id,
+                    "message": message,
+                    "include_bots": include_bots,
+                    "guild": interaction.guild,
+                    "audit_message_id": strike_msg.id,
+                    "audit_channel_id": audit_channel.id
+                }
+                
+                task = asyncio.create_task(
+                    self._auto_post_timer(shout_id, interaction.guild)
+                )
+                self.strike_tasks[shout_id] = task
+            else:
+                # Fallback if no audit channel
+                self.active_shouts[shout_id] = {
+                    "status": "PENDING_STRIKE",
+                    "user_id": interaction.user.id,
+                    "message": message,
+                    "include_bots": include_bots,
+                    "guild": interaction.guild
+                }
+                task = asyncio.create_task(
+                    self._auto_post_timer(shout_id, interaction.guild)
+                )
+                self.strike_tasks[shout_id] = task
+
+            await interaction.followup.send(
+                f"🚀 **Shout #{shout_id} submitted for review!**\n"
+                f"⏳ Mods have **{self.STRIKE_WINDOW_HOURS} hours** to strike it down.\n"
+                f"📋 Check the audit log for the pending shout.\n\n"
+                f"*If not struck down, it will automatically post.*",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="shout_treasury",
+        description="🏛️ Shout on behalf of a party or company using treasury funds"
+    )
+    @app_commands.describe(
+        entity_id="Party or Company ID to shout as",
+        message="The message you want to shout to everyone",
+        include_bots="Include bot accounts in the shout (default: False)"
+    )
+    @safety_wrapper("financial")
+    @financial_safety(required_balance=False)
+    async def shout_treasury(
+        self,
+        interaction: discord.Interaction,
+        entity_id: str,
+        message: str,
+        include_bots: bool = False
+    ):
+        """Shout on behalf of a party or company using treasury funds."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if len(message) > 2000:
+            await interaction.followup.send(
+                "❌ Message too long! Maximum 2000 characters.",
+                ephemeral=True
+            )
+            return
+        
+        clean_id = entity_id.strip().lower()
+        
+        # Get all entities the user manages
+        managed_entities = self._get_user_managed_parties(interaction.user.id)
+        
+        # Find the specific entity
+        entity = None
+        for e in managed_entities:
+            if e["party_id"] == clean_id:
+                entity = e
+                break
+        
+        if not entity:
+            # Check if entity exists but user doesn't manage it
+            db_entity = self._get_entity_by_id(clean_id)
+            if db_entity:
+                await interaction.followup.send(
+                    f"❌ You don't have permission to manage `{clean_id}`. You need the manager role for this entity.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ Entity `{clean_id}` not found.",
+                    ephemeral=True
+                )
+            return
+        
+        # Check if treasury has enough funds
+        if entity["treasury"] < self.SHOUT_COST:
+            entity_type = "Company" if entity["is_company"] else "Party"
+            await interaction.followup.send(
+                SmartErrorMessages.insufficient_treasury(
+                    entity["treasury"],
+                    self.SHOUT_COST,
+                    entity["name"]
+                ),
+                ephemeral=True
+            )
+            return
+        
+        # Check if user is blacklisted (treasury shouts still respect blacklist for the sender)
+        if await self.is_user_blacklisted(interaction.user.id):
+            await interaction.followup.send(
+                "❌ You have opted out of shouts. Use `/shout_opt_in` to rejoin.",
+                ephemeral=True
+            )
+            return
+        
+        # Cooldown check (treasury shouts have a separate cooldown per entity)
+        if await self.is_entity_on_cooldown(clean_id):
+            remaining = await self.get_entity_cooldown_remaining(clean_id)
+            await interaction.followup.send(
+                f"⏳ This entity is on cooldown! Try again in **{remaining}**.",
+                ephemeral=True
+            )
+            return
+        
+        # Deduct from treasury and create shout
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Deduct from treasury
+            cursor.execute(
+                "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
+                (self.SHOUT_COST, clean_id)
+            )
+            
+            # Log the treasury deduction
             cursor.execute("""
-                INSERT INTO shout_cooldowns (user_id, last_shout_at) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET last_shout_at = ?
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, 'treasury_shout', ?, ?, ?)
             """, (
                 interaction.user.id,
+                -self.SHOUT_COST,
+                f"Treasury shout from {entity['name']} ({clean_id}): {message[:50]}...",
+                clean_id
+            ))
+            
+            # Get updated treasury after deduction
+            cursor.execute(
+                "SELECT treasury FROM parties WHERE party_id = ?",
+                (clean_id,)
+            )
+            updated_row = cursor.fetchone()
+            new_treasury = updated_row["treasury"] if updated_row else 0.0
+            
+            # Create shout log entry
+            cursor.execute("""
+                INSERT INTO shout_log (
+                    user_id, guild_id, message, cost, status, 
+                    total_targeted, total_sent, total_failed,
+                    strike_window_end, include_bots, entity_id, entity_name, is_company_shout
+                ) VALUES (?, ?, ?, ?, 'RUNNING', 0, 0, 0, NULL, ?, ?, ?, ?)
+            """, (
+                interaction.user.id,
+                interaction.guild_id,
+                message,
+                self.SHOUT_COST,
+                1 if include_bots else 0,
+                clean_id,
+                entity["name"],
+                1 if entity["is_company"] else 0
+            ))
+            shout_id = cursor.lastrowid
+            
+            # Set entity cooldown
+            cursor.execute("""
+                INSERT INTO shout_entity_cooldowns (entity_id, last_shout_at) VALUES (?, ?)
+                ON CONFLICT(entity_id) DO UPDATE SET last_shout_at = ?
+            """, (
+                clean_id,
                 datetime.now().isoformat(),
                 datetime.now().isoformat()
             ))
             conn.commit()
         
-        audit_channel = await self._get_audit_channel(interaction.guild)
+        # Execute the shout immediately (no strike window for treasury shouts)
+        entity_type = "Company" if entity["is_company"] else "Party"
         
-        if audit_channel:
-            embed = discord.Embed(
-                title=f"📢 **PENDING SHOUT #{shout_id}**",
-                description=f"**Proposed by:** {interaction.user.mention}\n"
-                           f"**Message:**\n```\n{message}\n```\n"
-                           f"**Cost:** ${self.SHOUT_COST:.2f}\n"
-                           f"**Includes Bots:** {'Yes' if include_bots else 'No'}\n\n"
-                           f"⏳ **Strike Window:** {self.STRIKE_WINDOW_HOURS} hours\n"
-                           f"**Expires:** <t:{int((datetime.now() + timedelta(hours=self.STRIKE_WINDOW_HOURS)).timestamp())}:R>",
-                color=discord.Color.yellow(),
-                timestamp=datetime.now()
-            )
-            embed.set_footer(text="Admins/Mods: Click Strike to cancel this shout and refund the user")
-            
-            view = StrikeView(shout_id, self.bot)
-            
-            strike_msg = await audit_channel.send(embed=embed, view=view)
-            
-            self.active_shouts[shout_id] = {
-                "status": "PENDING_STRIKE",
-                "user_id": interaction.user.id,
-                "message": message,
-                "include_bots": include_bots,
-                "guild": interaction.guild,
-                "audit_message_id": strike_msg.id,
-                "audit_channel_id": audit_channel.id
-            }
-            
-            task = asyncio.create_task(
-                self._auto_post_timer(shout_id, interaction.guild)
-            )
-            self.strike_tasks[shout_id] = task
+        self.active_shouts[shout_id] = {
+            "status": "RUNNING",
+            "user_id": interaction.user.id,
+            "message": message,
+            "include_bots": include_bots,
+            "guild": interaction.guild,
+            "entity_id": clean_id,
+            "entity_name": entity["name"],
+            "is_company": entity["is_company"],
+            "is_treasury_shout": True
+        }
         
         await interaction.followup.send(
-            f"🚀 **Shout #{shout_id} submitted for review!**\n"
-            f"⏳ Mods have **{self.STRIKE_WINDOW_HOURS} hours** to strike it down.\n"
-            f"📋 Check the audit log for the pending shout.\n\n"
-            f"*If not struck down, it will automatically post.*",
+            f"🚀 **Treasury Shout #{shout_id} is being sent!**\n"
+            f"🏛️ **{entity['name']}** ({entity_type}) spent **${self.SHOUT_COST:.2f}** from treasury\n"
+            f"💰 Remaining treasury: **${new_treasury:.2f}**\n"
+            f"📋 Message: {message[:100]}{'...' if len(message) > 100 else ''}",
             ephemeral=True
         )
+        
+        # Log in audit channel
+        audit_channel = await self._get_audit_channel(interaction.guild)
+        if audit_channel:
+            embed = discord.Embed(
+                title=f"🏛️ **TREASURY SHOUT #{shout_id}**",
+                description=f"**Entity:** {entity['name']} (`{clean_id}`)\n"
+                           f"**Entity Type:** {entity_type}\n"
+                           f"**Sent by:** {interaction.user.mention}\n"
+                           f"**Message:**\n```\n{message}\n```\n"
+                           f"**Cost:** ${self.SHOUT_COST:.2f}\n"
+                           f"**New Treasury:** ${new_treasury:.2f}\n"
+                           f"**Includes Bots:** {'Yes' if include_bots else 'No'}",
+                color=discord.Color.purple(),
+                timestamp=datetime.now()
+            )
+            embed.set_footer(text="Treasury shout - executed immediately")
+            await audit_channel.send(embed=embed)
+        
+        # Execute the shout
+        await self._send_shout_as_entity(
+            interaction.guild,
+            shout_id,
+            message,
+            include_bots,
+            interaction.user,
+            entity["name"],
+            clean_id,
+            entity["is_company"]
+        )
+
+    @app_commands.command(
+        name="shout_manage_entities",
+        description="📋 List all parties and companies you can shout for"
+    )
+    async def shout_manage_entities(self, interaction: discord.Interaction):
+        """List all entities the user can shout on behalf of."""
+        await interaction.response.defer(ephemeral=True)
+        
+        managed = self._get_user_managed_parties(interaction.user.id)
+        
+        if not managed:
+            await interaction.followup.send(
+                "❌ You don't manage any parties or companies.\n\n"
+                "To shout on behalf of an entity, you need:\n"
+                "• The manager role for that entity, or\n"
+                "• Administrator permissions",
+                ephemeral=True
+            )
+            return
+        
+        embed = discord.Embed(
+            title="🏛️ Entities You Can Shout For",
+            description="Use `/shout_treasury entity_id:<id> message:<text>` to shout on behalf of an entity.",
+            color=discord.Color.blue(),
+            timestamp=datetime.now()
+        )
+        
+        for e in managed:
+            entity_type = "🏬 Company" if e["is_company"] else "🏢 Party"
+            can_afford = e["treasury"] >= self.SHOUT_COST
+            cost_status = "✅" if can_afford else "❌"
+            
+            # Check if entity is on cooldown
+            on_cooldown = await self.is_entity_on_cooldown(e["party_id"])
+            cooldown_status = "⏳" if on_cooldown else "✅"
+            
+            embed.add_field(
+                name=f"{entity_type} {e['name']}",
+                value=f"**ID:** `{e['party_id']}`\n"
+                      f"**Treasury:** ${e['treasury']:.2f}\n"
+                      f"**Can Afford:** {cost_status} (need ${self.SHOUT_COST:.2f})\n"
+                      f"**Cooldown:** {cooldown_status} (24h)",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Total entities: {len(managed)}")
+        await interaction.followup.send(embed=embed)
 
     async def _auto_post_timer(self, shout_id: int, guild: discord.Guild):
         """Timer that auto-posts the shout after strike window expires."""
@@ -173,6 +654,11 @@ class ShoutCog(commands.Cog):
         if shout_id in self.active_shouts:
             shout_data = self.active_shouts.get(shout_id)
             if shout_data and shout_data["status"] == "PENDING_STRIKE":
+                # Check if it's a treasury shout (these are executed immediately, so shouldn't happen)
+                if shout_data.get("is_treasury_shout", False):
+                    # This shouldn't happen, but just in case
+                    self.active_shouts.pop(shout_id, None)
+                    return
                 await self._execute_shout(shout_id, guild)
         
         self.strike_tasks.pop(shout_id, None)
@@ -181,6 +667,12 @@ class ShoutCog(commands.Cog):
         """Execute the actual shout (called after strike window expires or manually)."""
         shout_data = self.active_shouts.get(shout_id)
         if not shout_data:
+            return
+        
+        # Check if it's a treasury shout - these are handled differently
+        if shout_data.get("is_treasury_shout", False):
+            # This shouldn't happen since treasury shouts execute immediately
+            self.active_shouts.pop(shout_id, None)
             return
         
         with get_db() as conn:
@@ -267,6 +759,16 @@ class ShoutCog(commands.Cog):
     ):
         """Process the shout."""
         try:
+            # Check if it's a treasury shout
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT entity_id, entity_name, is_company_shout FROM shout_log WHERE shout_id = ?
+                """, (shout_id,))
+                shout_info = cursor.fetchone()
+            
+            is_treasury = shout_info and shout_info["entity_id"] is not None
+            
             members = [m for m in guild.members if include_bots or not m.bot]
             blacklisted = await self.get_blacklisted_users()
             members = [m for m in members if m.id not in blacklisted]
@@ -291,11 +793,19 @@ class ShoutCog(commands.Cog):
             sent_count = 0
             failed_count = 0
             
+            # Determine shout type for display
+            if is_treasury:
+                entity_type = "🏬 Company" if shout_info["is_company_shout"] else "🏢 Party"
+                from_line = f"From: **{shout_info['entity_name']}** ({shout_info['entity_id']})\nSent by: {sender.display_name}"
+            else:
+                entity_type = "📢"
+                from_line = f"From: {sender.display_name}"
+            
             for i, member in enumerate(members):
                 try:
                     shout_message = (
-                        f"📢 **MASS SHOUT #{shout_id}**\n"
-                        f"From: {sender.display_name}\n"
+                        f"{entity_type} **SHOUT #{shout_id}**\n"
+                        f"{from_line}\n"
                         f"\n{message}\n\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔄 To opt out: `/shout_opt_out` (${self.OPT_OUT_COST:.2f})"
@@ -444,6 +954,14 @@ class ShoutCog(commands.Cog):
         if not shout_data:
             return False, "Shout not found or already processed."
         
+        # Superuser shouts cannot be struck
+        if shout_data.get("is_superuser", False):
+            return False, "❌ Superuser shouts cannot be struck down."
+        
+        # Treasury shouts cannot be struck (they execute immediately)
+        if shout_data.get("is_treasury_shout", False):
+            return False, "❌ Treasury shouts cannot be struck down (they execute immediately)."
+        
         if shout_data["status"] != "PENDING_STRIKE":
             return False, f"Shout is already {shout_data['status']}."
         
@@ -564,8 +1082,15 @@ class ShoutCog(commands.Cog):
             
             is_owner = shout["user_id"] == interaction.user.id
             is_admin = interaction.user.guild_permissions.administrator
+            is_superuser = interaction.user.id == self.SUPERUSER_ID
             
-            if not (is_owner or is_admin):
+            # Check if user manages the entity (if it's a treasury shout)
+            is_entity_manager = False
+            if shout["entity_id"]:
+                managed = self._get_user_managed_parties(interaction.user.id)
+                is_entity_manager = any(e["party_id"] == shout["entity_id"] for e in managed)
+            
+            if not (is_owner or is_admin or is_superuser or is_entity_manager):
                 await interaction.followup.send(
                     "❌ You don't have permission to view this shout's status.",
                     ephemeral=True
@@ -593,17 +1118,41 @@ class ShoutCog(commands.Cog):
                 inline=True
             )
             
-            embed.add_field(
-                name="Sender",
-                value=f"<@{shout['user_id']}>",
-                inline=True
-            )
+            # Show sender info
+            if shout["entity_id"]:
+                entity_type = "Company" if shout["is_company_shout"] else "Party"
+                embed.add_field(
+                    name="Sender",
+                    value=f"{shout['entity_name']} ({entity_type}) via <@{shout['user_id']}>",
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="Sender",
+                    value=f"<@{shout['user_id']}>",
+                    inline=True
+                )
             
             embed.add_field(
                 name="Cost",
                 value=f"${shout['cost']:.2f}",
                 inline=True
             )
+            
+            if shout["entity_id"]:
+                embed.add_field(
+                    name="Entity ID",
+                    value=f"`{shout['entity_id']}`",
+                    inline=True
+                )
+            
+            # Show superuser flag if applicable
+            if interaction.user.id == self.SUPERUSER_ID and shout["user_id"] == self.SUPERUSER_ID:
+                embed.add_field(
+                    name="⚡ Superuser",
+                    value="This shout bypassed all restrictions",
+                    inline=True
+                )
             
             if shout["strike_reason"]:
                 embed.add_field(
@@ -674,6 +1223,14 @@ class ShoutCog(commands.Cog):
         """Opt out of receiving future shouts."""
         await interaction.response.defer(ephemeral=True)
         
+        # Superuser cannot opt out (or rather, it doesn't matter since they bypass)
+        if interaction.user.id == self.SUPERUSER_ID:
+            await interaction.followup.send(
+                "⚡ As a superuser, you bypass shout restrictions. You cannot opt out.",
+                ephemeral=True
+            )
+            return
+        
         if await self.is_user_blacklisted(interaction.user.id):
             await interaction.followup.send(
                 "ℹ️ You're already opted out of shouts.",
@@ -736,6 +1293,13 @@ class ShoutCog(commands.Cog):
         """Opt back in to receive shouts."""
         await interaction.response.defer(ephemeral=True)
         
+        if interaction.user.id == self.SUPERUSER_ID:
+            await interaction.followup.send(
+                "⚡ As a superuser, you bypass shout restrictions.",
+                ephemeral=True
+            )
+            return
+        
         if not await self.is_user_blacklisted(interaction.user.id):
             await interaction.followup.send(
                 "ℹ️ You're not opted out of shouts.",
@@ -773,9 +1337,9 @@ class ShoutCog(commands.Cog):
         """Delete all messages sent by a shout (Admin only)."""
         await interaction.response.defer(ephemeral=True)
         
-        if not interaction.user.guild_permissions.administrator:
+        if not interaction.user.guild_permissions.administrator and interaction.user.id != self.SUPERUSER_ID:
             await interaction.followup.send(
-                "❌ Only administrators can delete shout messages.",
+                "❌ Only administrators or superusers can delete shout messages.",
                 ephemeral=True
             )
             return
@@ -855,10 +1419,11 @@ class ShoutCog(commands.Cog):
         
         target_user = user or interaction.user
         is_admin = interaction.user.guild_permissions.administrator
+        is_superuser = interaction.user.id == self.SUPERUSER_ID
         
-        if user and not is_admin:
+        if user and not (is_admin or is_superuser):
             await interaction.followup.send(
-                "❌ Only administrators can view other users' shout history.",
+                "❌ Only administrators or superusers can view other users' shout history.",
                 ephemeral=True
             )
             return
@@ -903,6 +1468,13 @@ class ShoutCog(commands.Cog):
                     results = "No targets"
                 
                 created = datetime.fromisoformat(shout["created_at"])
+                
+                # Show entity info if treasury shout
+                entity_info = ""
+                if shout["entity_id"]:
+                    entity_type = "Company" if shout["is_company_shout"] else "Party"
+                    entity_info = f"\nEntity: **{shout['entity_name']}** ({entity_type})"
+                
                 embed.add_field(
                     name=f"#{shout['shout_id']} - {status_emoji} {shout['status']}",
                     value=(
@@ -910,6 +1482,7 @@ class ShoutCog(commands.Cog):
                         f"Results: {results}\n"
                         f"Cost: ${shout['cost']:.2f}\n"
                         f"Time: <t:{int(created.timestamp())}:R>"
+                        + entity_info
                         + (f"\nStruck by: <@{shout['struck_by']}>" if shout['struck_by'] else "")
                         + (f"\nReason: {shout['strike_reason']}" if shout['strike_reason'] else "")
                     ),
@@ -919,9 +1492,59 @@ class ShoutCog(commands.Cog):
             embed.set_footer(text=f"Showing last {len(shouts)} shouts")
             await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # ─── HELPER METHODS ─────────────────────────────────────────────────────────
+    # ─── ENTITY COOLDOWN HELPERS ──────────────────────────────────────────────
+
+    async def is_entity_on_cooldown(self, entity_id: str) -> bool:
+        """Check if an entity is on cooldown for treasury shouts."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT last_shout_at FROM shout_entity_cooldowns 
+                WHERE entity_id = ?
+            """, (entity_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return False
+            
+            last_shout = datetime.fromisoformat(row["last_shout_at"])
+            cooldown_end = last_shout + timedelta(hours=self.COOLDOWN_HOURS)
+            return datetime.now() < cooldown_end
+
+    async def get_entity_cooldown_remaining(self, entity_id: str) -> str:
+        """Get time remaining for an entity's cooldown."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT last_shout_at FROM shout_entity_cooldowns 
+                WHERE entity_id = ?
+            """, (entity_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return "No cooldown"
+            
+            last_shout = datetime.fromisoformat(row["last_shout_at"])
+            cooldown_end = last_shout + timedelta(hours=self.COOLDOWN_HOURS)
+            remaining = cooldown_end - datetime.now()
+            
+            if remaining.total_seconds() <= 0:
+                return "Cooldown expired"
+            
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            
+            if hours > 0:
+                return f"{hours}h {minutes}m"
+            return f"{minutes}m"
+
+    # ─── USER HELPER METHODS ──────────────────────────────────────────────────
 
     async def is_user_blacklisted(self, user_id: int) -> bool:
+        """Check if a user is blacklisted from shouts."""
+        # Superuser is never blacklisted
+        if user_id == self.SUPERUSER_ID:
+            return False
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -931,12 +1554,17 @@ class ShoutCog(commands.Cog):
             return cursor.fetchone() is not None
 
     async def get_blacklisted_users(self) -> List[int]:
+        """Get all blacklisted users."""
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM shout_blacklist")
             return [row["user_id"] for row in cursor.fetchall()]
 
     async def is_on_cooldown(self, user_id: int) -> bool:
+        """Check if a user is on cooldown for personal shouts."""
+        # Superuser has no cooldown
+        if user_id == self.SUPERUSER_ID:
+            return False
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -953,6 +1581,7 @@ class ShoutCog(commands.Cog):
             return datetime.now() < cooldown_end
 
     async def get_cooldown_remaining(self, user_id: int) -> str:
+        """Get time remaining for a user's cooldown."""
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -1001,7 +1630,23 @@ class StrikeView(discord.ui.View):
     async def strike_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Strike down the shout."""
         
-        # ✅ CORRECT PERMISSION CHECK - no role checks, no read_message_history
+        # Check if superuser - cannot strike superuser shouts
+        shout_cog = self.bot.get_cog("ShoutCog")
+        if shout_cog:
+            shout_data = shout_cog.active_shouts.get(self.shout_id)
+            if shout_data and shout_data.get("is_superuser", False):
+                await interaction.response.send_message(
+                    "❌ Superuser shouts cannot be struck down!",
+                    ephemeral=True
+                )
+                return
+            if shout_data and shout_data.get("is_treasury_shout", False):
+                await interaction.response.send_message(
+                    "❌ Treasury shouts cannot be struck down! They execute immediately.",
+                    ephemeral=True
+                )
+                return
+        
         has_mod_perms = (
             interaction.user.guild_permissions.administrator or
             interaction.user.guild_permissions.manage_messages or
@@ -1011,7 +1656,6 @@ class StrikeView(discord.ui.View):
             interaction.user.guild_permissions.ban_members or
             interaction.user.guild_permissions.manage_nicknames or
             interaction.user.guild_permissions.manage_webhooks or
-            # Channel-specific delete messages permission
             interaction.channel.permissions_for(interaction.user).manage_messages
         )
         

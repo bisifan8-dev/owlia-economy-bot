@@ -1,3 +1,5 @@
+# views.py - Full file with fixed BuyFromBotView
+
 import io
 import sqlite3
 import datetime
@@ -275,26 +277,23 @@ class BuyFromBotView(discord.ui.View):
                 )
                 return
 
+            # Deduct money from user
             cursor.execute(
                 "UPDATE users SET balance = balance - ? WHERE user_id = ?",
                 (total_cost, interaction.user.id),
             )
             
-            cursor.execute(
-                "UPDATE parties SET treasury = treasury + ? WHERE party_id = ?",
-                (total_cost, self.party_id),
-            )
+            # *** FIXED: DO NOT add money to treasury when buying from bot! ***
+            # The bot sells its own shares, treasury should NOT change
+            # cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?",
+            #               (total_cost, self.party_id))  # ← REMOVED - WRONG!
 
-            cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (self.party_id,))
-            p_data = cursor.fetchone()
-            new_price = p_data["treasury"] / p_data["total_shares"] if p_data["total_shares"] > 0 else 0.0
-            cursor.execute("INSERT INTO stock_history (party_id, price) VALUES (?, ?)", (self.party_id, new_price))
-            
+            # Give shares to user (bot's unissued shares)
             cursor.execute(
                 """
                 INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
-                ON CONFLICT DO UPDATE SET shares_owned = shares_owned + ?
-            """,
+                ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
+                """,
                 (interaction.user.id, self.party_id, self.shares, self.shares),
             )
             
@@ -304,13 +303,20 @@ class BuyFromBotView(discord.ui.View):
                 INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (interaction.user.id, "buy", -total_cost, f"Purchased {self.shares:.2f} shares from bot", self.party_id)
+                (interaction.user.id, "buy_from_bot", -total_cost, f"Purchased {self.shares:.2f} shares from bot at ${self.price_per_share:.2f} each", self.party_id)
             )
+            
+            # Get current price for display (unchanged)
+            cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (self.party_id,))
+            p_data = cursor.fetchone()
+            current_price = p_data["treasury"] / p_data["total_shares"] if p_data["total_shares"] > 0 else 0.0
+            
             conn.commit()
 
         button.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Purchased **{self.shares:.2f}** share(s) for **${total_cost:.2f}** directly from the bot!",
+            content=f"✅ Purchased **{self.shares:.2f}** share(s) for **${total_cost:.2f}** directly from the bot!\n"
+                    f"💰 Treasury unchanged: **${p_data['treasury']:.2f}** | Price: **${current_price:.2f}**",
             view=self,
         )
         if interaction.guild_id:
@@ -425,7 +431,7 @@ class OrderActionView(discord.ui.View):
                     "SELL",
                     order["order_id"],
                 )
-            else:
+            else:  # "BUY" Order Execution
                 cursor.execute(
                     "SELECT shares_owned FROM shares WHERE user_id = ? AND party_id = ?",
                     (interaction.user.id, order["party_id"]),

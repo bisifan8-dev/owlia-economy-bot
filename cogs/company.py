@@ -181,11 +181,11 @@ class CompanyCog(commands.Cog):
         amount="Capital contribution amount"
     )
     async def invest(self, interaction: discord.Interaction, company_id: str, amount: float):
-        await interaction.response.defer(ephemeral=True)
+        # DO NOT defer here - modals require response.send_modal()
         clean_id = company_id.strip().lower()
 
         if amount <= 0:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 SmartErrorMessages.invalid_amount(amount),
                 ephemeral=True
             )
@@ -197,7 +197,7 @@ class CompanyCog(commands.Cog):
             company = cursor.fetchone()
 
             if not company:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.party_not_found(clean_id),
                     ephemeral=True
                 )
@@ -208,7 +208,7 @@ class CompanyCog(commands.Cog):
             bal = u_row["balance"] if u_row else 0.0
 
             if bal < amount:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     SmartErrorMessages.insufficient_funds(bal, amount, "invest"),
                     ephemeral=True
                 )
@@ -307,7 +307,7 @@ class CompanyCog(commands.Cog):
             execute_investment,
             "invest"
         )
-        await interaction.followup.send_modal(modal)
+        await interaction.response.send_modal(modal)
 
     @app_commands.command(
         name="company_info",

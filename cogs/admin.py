@@ -7,6 +7,7 @@ from database import get_db
 from views import SetupView
 from safety import safety_wrapper, financial_safety, InputValidator, SAFETY_CONFIG
 from utils.errors import SmartErrorMessages
+import datetime
 
 
 class AdminCog(commands.Cog):
@@ -539,10 +540,30 @@ class AdminCog(commands.Cog):
                 """,
                 (target.id, "admin_add_balance", amount, "Admin added balance", None)
             )
+            
+            # Log admin action
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (interaction.user.id, "admin_action", 0, f"Added ${amount:.2f} to {target.display_name}", None)
+            )
             conn.commit()
-        await interaction.response.send_message(
-            f"✅ Added **${amount:.2f}** to {target.mention}.", ephemeral=True
+        
+        embed = discord.Embed(
+            title="✅ Balance Added",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.now()
         )
+        embed.add_field(name="User", value=target.mention, inline=True)
+        embed.add_field(name="Amount Added", value=f"**${amount:.2f}**", inline=True)
+        embed.set_footer(
+            text=f"Added by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="remove_balance",
@@ -584,6 +605,7 @@ class AdminCog(commands.Cog):
             
             # Determine actual amount to remove (can't go below 0)
             remove_amount = min(amount, current_balance)
+            new_balance = current_balance - remove_amount
             
             # Update the balance
             cursor.execute(
@@ -611,23 +633,535 @@ class AdminCog(commands.Cog):
                 """,
                 (interaction.user.id, "admin_action", 0, f"Removed ${remove_amount:.2f} from {target.display_name}", None)
             )
-            
             conn.commit()
         
-        new_balance = current_balance - remove_amount
+        embed = discord.Embed(
+            title="✅ Balance Removed",
+            color=discord.Color.orange(),
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(name="User", value=target.mention, inline=True)
+        embed.add_field(name="Amount Removed", value=f"**${remove_amount:.2f}**", inline=True)
+        embed.add_field(name="New Balance", value=f"**${new_balance:.2f}**", inline=True)
         
         if amount > current_balance:
+            embed.add_field(
+                name="⚠️ Note",
+                value=f"Attempted to remove ${amount:.2f}, but balance was only ${current_balance:.2f}. Removed ${remove_amount:.2f}.",
+                inline=False
+            )
+        
+        embed.set_footer(
+            text=f"Removed by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="add_entity_balance",
+        description="💵 Manually adds money to a party or company's treasury (Admin only)."
+    )
+    @app_commands.describe(
+        entity_id="The party or company ID to add funds to",
+        amount="Amount to add to the treasury"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @safety_wrapper("admin")
+    @financial_safety(required_balance=False)
+    async def add_entity_balance(
+        self, 
+        interaction: discord.Interaction, 
+        entity_id: str, 
+        amount: float
+    ):
+        """Add money to a party or company's treasury."""
+        # Safety: Validate amount
+        valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
+        if not valid:
             await interaction.response.send_message(
-                f"⚠️ Removed **${remove_amount:.2f}** from {target.mention} (attempted ${amount:.2f}, but balance was only ${current_balance:.2f}).\n"
-                f"💰 New balance: **${new_balance:.2f}**",
+                SmartErrorMessages.invalid_amount(amount),
                 ephemeral=True
             )
-        else:
+            return
+        
+        clean_id = entity_id.strip().lower()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if entity exists
+            cursor.execute(
+                "SELECT party_id, name, treasury, total_shares, is_company, structure_type FROM parties WHERE party_id = ?",
+                (clean_id,)
+            )
+            entity = cursor.fetchone()
+            
+            if not entity:
+                await interaction.response.send_message(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
+                return
+            
+            # Get current treasury
+            current_treasury = entity["treasury"]
+            new_treasury = current_treasury + amount
+            
+            # Update treasury
+            cursor.execute(
+                "UPDATE parties SET treasury = treasury + ? WHERE party_id = ?",
+                (amount, clean_id)
+            )
+            
+            # Update stock history with new price
+            if entity["total_shares"] > 0:
+                new_price = new_treasury / entity["total_shares"]
+                cursor.execute(
+                    "INSERT INTO stock_history (party_id, price) VALUES (?, ?)",
+                    (clean_id, new_price)
+                )
+            
+            # Log the transaction
+            entity_type = "Company" if entity["is_company"] else "Party"
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction.user.id, 
+                    "admin_add_entity_balance", 
+                    amount, 
+                    f"Admin added ${amount:.2f} to {entity_type} '{entity['name']}' treasury", 
+                    clean_id
+                )
+            )
+            
+            # Log admin action
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, 'admin_action', 0, ?, ?)
+                """,
+                (
+                    interaction.user.id,
+                    f"Added ${amount:.2f} to {entity_type} '{entity['name']}' ({clean_id}) treasury",
+                    clean_id
+                )
+            )
+            conn.commit()
+        
+        # Prepare response
+        embed = discord.Embed(
+            title=f"✅ {entity_type} Treasury Updated",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(
+            name="Entity",
+            value=f"**{entity['name']}** (`{clean_id}`)",
+            inline=True
+        )
+        embed.add_field(
+            name="Amount Added",
+            value=f"**${amount:.2f}**",
+            inline=True
+        )
+        embed.add_field(
+            name="Type",
+            value=entity_type,
+            inline=True
+        )
+        embed.add_field(
+            name="Previous Treasury",
+            value=f"${current_treasury:.2f}",
+            inline=True
+        )
+        embed.add_field(
+            name="New Treasury",
+            value=f"**${new_treasury:.2f}**",
+            inline=True
+        )
+        embed.add_field(
+            name="New Share Price",
+            value=f"${new_price:.2f}" if entity["total_shares"] > 0 else "N/A",
+            inline=True
+        )
+        embed.set_footer(
+            text=f"Added by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="remove_entity_balance",
+        description="💸 Manually removes money from a party or company's treasury (Admin only)."
+    )
+    @app_commands.describe(
+        entity_id="The party or company ID to remove funds from",
+        amount="Amount to remove from the treasury"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @safety_wrapper("admin")
+    @financial_safety(required_balance=False)
+    async def remove_entity_balance(
+        self, 
+        interaction: discord.Interaction, 
+        entity_id: str, 
+        amount: float
+    ):
+        """Remove money from a party or company's treasury."""
+        # Safety: Validate amount
+        valid, msg = InputValidator.validate_amount(amount, allow_zero=False)
+        if not valid:
             await interaction.response.send_message(
-                f"✅ Removed **${remove_amount:.2f}** from {target.mention}.\n"
-                f"💰 New balance: **${new_balance:.2f}**",
+                SmartErrorMessages.invalid_amount(amount),
                 ephemeral=True
             )
+            return
+        
+        clean_id = entity_id.strip().lower()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if entity exists
+            cursor.execute(
+                "SELECT party_id, name, treasury, total_shares, is_company, structure_type FROM parties WHERE party_id = ?",
+                (clean_id,)
+            )
+            entity = cursor.fetchone()
+            
+            if not entity:
+                await interaction.response.send_message(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
+                return
+            
+            # Check if entity has enough funds
+            current_treasury = entity["treasury"]
+            if current_treasury <= 0:
+                await interaction.response.send_message(
+                    f"ℹ️ **{entity['name']}** already has **${current_treasury:.2f}** (nothing to remove).",
+                    ephemeral=True
+                )
+                return
+            
+            # Determine actual amount to remove (can't go below 0)
+            remove_amount = min(amount, current_treasury)
+            new_treasury = current_treasury - remove_amount
+            
+            # Update treasury
+            cursor.execute(
+                "UPDATE parties SET treasury = treasury - ? WHERE party_id = ?",
+                (remove_amount, clean_id)
+            )
+            
+            # Update stock history with new price
+            if entity["total_shares"] > 0:
+                new_price = new_treasury / entity["total_shares"]
+                cursor.execute(
+                    "INSERT INTO stock_history (party_id, price) VALUES (?, ?)",
+                    (clean_id, new_price)
+                )
+            
+            # Log the transaction
+            entity_type = "Company" if entity["is_company"] else "Party"
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction.user.id, 
+                    "admin_remove_entity_balance", 
+                    -remove_amount, 
+                    f"Admin removed ${remove_amount:.2f} from {entity_type} '{entity['name']}' treasury", 
+                    clean_id
+                )
+            )
+            
+            # Log admin action
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, 'admin_action', 0, ?, ?)
+                """,
+                (
+                    interaction.user.id,
+                    f"Removed ${remove_amount:.2f} from {entity_type} '{entity['name']}' ({clean_id}) treasury",
+                    clean_id
+                )
+            )
+            conn.commit()
+        
+        # Prepare response
+        embed = discord.Embed(
+            title=f"✅ {entity_type} Treasury Updated",
+            color=discord.Color.orange() if remove_amount > 0 else discord.Color.gray(),
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(
+            name="Entity",
+            value=f"**{entity['name']}** (`{clean_id}`)",
+            inline=True
+        )
+        embed.add_field(
+            name="Amount Removed",
+            value=f"**${remove_amount:.2f}**",
+            inline=True
+        )
+        embed.add_field(
+            name="Type",
+            value=entity_type,
+            inline=True
+        )
+        embed.add_field(
+            name="Previous Treasury",
+            value=f"${current_treasury:.2f}",
+            inline=True
+        )
+        embed.add_field(
+            name="New Treasury",
+            value=f"**${new_treasury:.2f}**",
+            inline=True
+        )
+        embed.add_field(
+            name="New Share Price",
+            value=f"${new_price:.2f}" if entity["total_shares"] > 0 else "N/A",
+            inline=True
+        )
+        
+        if amount > current_treasury:
+            embed.add_field(
+                name="⚠️ Note",
+                value=f"Attempted to remove ${amount:.2f}, but treasury only had ${current_treasury:.2f}. Removed ${remove_amount:.2f}.",
+                inline=False
+            )
+        
+        embed.set_footer(
+            text=f"Removed by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="entity_balances",
+        description="📊 View all parties and companies with their treasury balances (Admin only)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @safety_wrapper("admin")
+    async def entity_balances(
+        self,
+        interaction: discord.Interaction
+    ):
+        """View all entities and their treasury balances."""
+        await interaction.response.defer(ephemeral=True)
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT party_id, name, treasury, total_shares, is_company, structure_type
+                FROM parties 
+                WHERE is_setup = 1
+                ORDER BY is_company DESC, treasury DESC
+            """)
+            entities = cursor.fetchall()
+        
+        if not entities:
+            await interaction.followup.send(
+                "📭 No parties or companies registered yet.",
+                ephemeral=True
+            )
+            return
+        
+        embed = discord.Embed(
+            title="🏛️ Entity Treasury Balances",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        # Separate companies and parties
+        companies = [e for e in entities if e["is_company"]]
+        parties = [e for e in entities if not e["is_company"]]
+        
+        total_treasury = sum(e["treasury"] for e in entities)
+        total_companies = len(companies)
+        total_parties = len(parties)
+        
+        embed.set_footer(
+            text=f"Total Entities: {len(entities)} | Total Treasury: ${total_treasury:.2f} | Companies: {total_companies} | Parties: {total_parties}"
+        )
+        
+        # Show companies
+        if companies:
+            company_text = ""
+            for e in companies[:10]:  # Limit to 10 per section
+                price = e["treasury"] / e["total_shares"] if e["total_shares"] > 0 else 0
+                company_text += f"🏬 **{e['name']}** (`{e['party_id']}`)\n"
+                company_text += f"   Treasury: **${e['treasury']:.2f}** | Share Price: ${price:.2f}\n"
+            
+            if len(companies) > 10:
+                company_text += f"\n*...and {len(companies) - 10} more companies*"
+            
+            embed.add_field(
+                name=f"🏬 Companies ({len(companies)})",
+                value=company_text or "*No companies*",
+                inline=False
+            )
+        
+        # Show parties
+        if parties:
+            party_text = ""
+            for e in parties[:10]:  # Limit to 10 per section
+                price = e["treasury"] / e["total_shares"] if e["total_shares"] > 0 else 0
+                party_text += f"🏛️ **{e['name']}** (`{e['party_id']}`)\n"
+                party_text += f"   Treasury: **${e['treasury']:.2f}** | Share Price: ${price:.2f}\n"
+            
+            if len(parties) > 10:
+                party_text += f"\n*...and {len(parties) - 10} more parties*"
+            
+            embed.add_field(
+                name=f"🏛️ Parties ({len(parties)})",
+                value=party_text or "*No parties*",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="set_entity_treasury",
+        description="💰 Set a party or company's treasury to a specific amount (Admin only)"
+    )
+    @app_commands.describe(
+        entity_id="The party or company ID to set treasury for",
+        amount="Exact amount to set the treasury to"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @safety_wrapper("admin")
+    @financial_safety(required_balance=False)
+    async def set_entity_treasury(
+        self,
+        interaction: discord.Interaction,
+        entity_id: str,
+        amount: float
+    ):
+        """Set a party or company's treasury to a specific amount."""
+        # Safety: Validate amount
+        if amount < 0:
+            await interaction.response.send_message(
+                "❌ Treasury cannot be set to a negative amount.",
+                ephemeral=True
+            )
+            return
+        
+        clean_id = entity_id.strip().lower()
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Check if entity exists
+            cursor.execute(
+                "SELECT party_id, name, treasury, total_shares, is_company, structure_type FROM parties WHERE party_id = ?",
+                (clean_id,)
+            )
+            entity = cursor.fetchone()
+            
+            if not entity:
+                await interaction.response.send_message(
+                    SmartErrorMessages.party_not_found(clean_id),
+                    ephemeral=True
+                )
+                return
+            
+            old_treasury = entity["treasury"]
+            new_treasury = amount
+            
+            # Update treasury
+            cursor.execute(
+                "UPDATE parties SET treasury = ? WHERE party_id = ?",
+                (new_treasury, clean_id)
+            )
+            
+            # Update stock history with new price
+            if entity["total_shares"] > 0:
+                new_price = new_treasury / entity["total_shares"]
+                cursor.execute(
+                    "INSERT INTO stock_history (party_id, price) VALUES (?, ?)",
+                    (clean_id, new_price)
+                )
+            
+            # Log the transaction
+            entity_type = "Company" if entity["is_company"] else "Party"
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction.user.id, 
+                    "admin_set_entity_treasury", 
+                    new_treasury - old_treasury, 
+                    f"Admin set {entity_type} '{entity['name']}' treasury from ${old_treasury:.2f} to ${new_treasury:.2f}", 
+                    clean_id
+                )
+            )
+            
+            # Log admin action
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, 'admin_action', 0, ?, ?)
+                """,
+                (
+                    interaction.user.id,
+                    f"Set {entity_type} '{entity['name']}' ({clean_id}) treasury to ${new_treasury:.2f}",
+                    clean_id
+                )
+            )
+            conn.commit()
+        
+        # Prepare response
+        embed = discord.Embed(
+            title=f"✅ {entity_type} Treasury Set",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(
+            name="Entity",
+            value=f"**{entity['name']}** (`{clean_id}`)",
+            inline=True
+        )
+        embed.add_field(
+            name="Type",
+            value=entity_type,
+            inline=True
+        )
+        embed.add_field(
+            name="Previous Treasury",
+            value=f"${old_treasury:.2f}",
+            inline=True
+        )
+        embed.add_field(
+            name="New Treasury",
+            value=f"**${new_treasury:.2f}**",
+            inline=True
+        )
+        embed.add_field(
+            name="New Share Price",
+            value=f"${new_price:.2f}" if entity["total_shares"] > 0 else "N/A",
+            inline=True
+        )
+        embed.set_footer(
+            text=f"Set by {interaction.user.display_name}",
+            icon_url=interaction.user.avatar.url if interaction.user.avatar else None
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):

@@ -1,4 +1,4 @@
-# database.py - Full file with shout additions
+# database.py - Full file with fixed execute_trade
 
 import sqlite3
 import datetime
@@ -258,7 +258,10 @@ def init_db():
                 strike_window_end TIMESTAMP,
                 strike_reason TEXT,
                 struck_by INTEGER,
-                include_bots INTEGER DEFAULT 0
+                include_bots INTEGER DEFAULT 0,
+                entity_id TEXT,
+                entity_name TEXT,
+                is_company_shout INTEGER DEFAULT 0
             )
         """
         )
@@ -290,6 +293,15 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS shout_cooldowns (
                 user_id INTEGER PRIMARY KEY,
+                last_shout_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shout_entity_cooldowns (
+                entity_id TEXT PRIMARY KEY,
                 last_shout_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
@@ -366,13 +378,18 @@ def init_db():
             )
 
         # Schema Migration Checks - Shout Tables (ensure all columns exist)
-        # This is for safety in case the tables already existed with different schemas
         cursor.execute("PRAGMA table_info(shout_log)")
         shout_cols = [col["name"] for col in cursor.fetchall()]
         if "completed_at" not in shout_cols:
             cursor.execute("ALTER TABLE shout_log ADD COLUMN completed_at TIMESTAMP")
         if "cooldown_until" not in shout_cols:
             cursor.execute("ALTER TABLE shout_log ADD COLUMN cooldown_until TIMESTAMP")
+        if "entity_id" not in shout_cols:
+            cursor.execute("ALTER TABLE shout_log ADD COLUMN entity_id TEXT")
+        if "entity_name" not in shout_cols:
+            cursor.execute("ALTER TABLE shout_log ADD COLUMN entity_name TEXT")
+        if "is_company_shout" not in shout_cols:
+            cursor.execute("ALTER TABLE shout_log ADD COLUMN is_company_shout INTEGER DEFAULT 0")
 
         cursor.execute(
             """
@@ -728,11 +745,12 @@ async def execute_trade(
             (buyer_id, party_id, shares, shares),
         )
 
-    # 3. Apply price variance ONLY if party (Normal companies are immune to Treasury shift on P2P)
-    if not party["is_company"]:
-        price_diff_per_share = trade_price - standard_cost
-        total_treasury_shift = price_diff_per_share * shares
-
+    # 3. Apply Treasury shift based on price difference from standard cost
+    # *** FIXED: Apply to BOTH companies AND parties ***
+    price_diff_per_share = trade_price - standard_cost
+    total_treasury_shift = price_diff_per_share * shares
+    
+    if total_treasury_shift != 0:
         new_treasury = max(0.0, party["treasury"] + total_treasury_shift)
         cursor.execute(
             "UPDATE parties SET treasury = ? WHERE party_id = ?",
@@ -742,7 +760,7 @@ async def execute_trade(
     # Track stock price in history
     cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (party_id,))
     latest_p = cursor.fetchone()
-    new_price = trade_price if party["is_company"] else (latest_p["treasury"] / latest_p["total_shares"] if latest_p["total_shares"] > 0 else 0.0)
+    new_price = latest_p["treasury"] / latest_p["total_shares"] if latest_p["total_shares"] > 0 else 0.0
     cursor.execute(
         "INSERT INTO stock_history (party_id, price) VALUES (?, ?)",
         (party_id, new_price),
