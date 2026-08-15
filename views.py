@@ -1,4 +1,4 @@
-# views.py - Full file with fixed BuyFromBotView
+# views.py - Complete file with fixed market interaction and acceptance queue system
 
 import io
 import sqlite3
@@ -8,7 +8,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import discord
-from database import get_db, execute_trade, get_user_share_weight
+from database import get_db, execute_trade, get_user_share_weight, get_order_remaining_shares
 
 
 class CompanyVoteView(discord.ui.View):
@@ -283,11 +283,6 @@ class BuyFromBotView(discord.ui.View):
                 (total_cost, interaction.user.id),
             )
             
-            # *** FIXED: DO NOT add money to treasury when buying from bot! ***
-            # The bot sells its own shares, treasury should NOT change
-            # cursor.execute("UPDATE parties SET treasury = treasury + ? WHERE party_id = ?",
-            #               (total_cost, self.party_id))  # ← REMOVED - WRONG!
-
             # Give shares to user (bot's unissued shares)
             cursor.execute(
                 """
@@ -306,7 +301,7 @@ class BuyFromBotView(discord.ui.View):
                 (interaction.user.id, "buy_from_bot", -total_cost, f"Purchased {self.shares:.2f} shares from bot at ${self.price_per_share:.2f} each", self.party_id)
             )
             
-            # Get current price for display (unchanged)
+            # Get current price for display
             cursor.execute("SELECT treasury, total_shares FROM parties WHERE party_id = ?", (self.party_id,))
             p_data = cursor.fetchone()
             current_price = p_data["treasury"] / p_data["total_shares"] if p_data["total_shares"] > 0 else 0.0
@@ -316,7 +311,7 @@ class BuyFromBotView(discord.ui.View):
         button.disabled = True
         await interaction.response.edit_message(
             content=f"✅ Purchased **{self.shares:.2f}** share(s) for **${total_cost:.2f}** directly from the bot!\n"
-                    f"💰 Treasury unchanged: **${p_data['treasury']:.2f}** | Price: **${current_price:.2f}**",
+                    f"💰 Treasury: **${p_data['treasury']:.2f}** | Price: **${current_price:.2f}**",
             view=self,
         )
         if interaction.guild_id:
@@ -374,6 +369,7 @@ class CounterOfferModal(discord.ui.Modal, title="Submit Counter-Offer"):
 
 
 class OrderActionView(discord.ui.View):
+    """View for interacting with an order (accept/counter) - DEPRECATED, kept for compatibility"""
 
     def __init__(self, order, bot_instance, refresh_callback):
         super().__init__(timeout=300)
@@ -386,82 +382,11 @@ class OrderActionView(discord.ui.View):
     async def accept_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if interaction.user.id == self.poster_id:
-            await interaction.response.send_message(
-                "❌ You cannot accept your own order.", ephemeral=True
-            )
-            return
-
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM market_orders WHERE order_id = ?",
-                (self.order["order_id"],),
-            )
-            order = cursor.fetchone()
-            if not order:
-                await interaction.response.send_message(
-                    "❌ This order is no longer available.", ephemeral=True
-                )
-                return
-
-            shares, price = order["shares_count"], order["price_per_share"]
-            total_cost = shares * price
-
-            if order["order_type"] == "SELL":
-                cursor.execute(
-                    "SELECT balance FROM users WHERE user_id = ?",
-                    (interaction.user.id,),
-                )
-                user_row = cursor.fetchone()
-                bal = user_row["balance"] if user_row else 0.0
-                if bal < total_cost:
-                    await interaction.response.send_message(
-                        "❌ You do not have enough funds.", ephemeral=True
-                    )
-                    return
-                await execute_trade(
-                    conn,
-                    cursor,
-                    interaction.user.id,
-                    self.poster_id,
-                    order["party_id"],
-                    shares,
-                    price,
-                    "SELL",
-                    order["order_id"],
-                )
-            else:  # "BUY" Order Execution
-                cursor.execute(
-                    "SELECT shares_owned FROM shares WHERE user_id = ? AND party_id = ?",
-                    (interaction.user.id, order["party_id"]),
-                )
-                s_row = cursor.fetchone()
-                owned = s_row["shares_owned"] if s_row else 0.0
-                if owned < shares:
-                    await interaction.response.send_message(
-                        "❌ You do not own enough shares.", ephemeral=True
-                    )
-                    return
-                await execute_trade(
-                    conn,
-                    cursor,
-                    self.poster_id,
-                    interaction.user.id,
-                    order["party_id"],
-                    shares,
-                    price,
-                    "BUY",
-                    order["order_id"],
-                )
-            conn.commit()
-
+        # This is now handled by the acceptance system - redirect user
         await interaction.response.send_message(
-            f"✅ **Trade Executed!** You accepted order `{order['order_id']:03d}`.",
-            ephemeral=True,
+            "📋 This has been replaced by the acceptance queue system. Please use the 'Interact with Offers' button to express interest.",
+            ephemeral=True
         )
-        if interaction.guild_id:
-            await self.refresh_callback(interaction.guild_id)
 
     @discord.ui.button(
         label="📉 Will Accept If Lower",
@@ -482,6 +407,7 @@ class OrderActionView(discord.ui.View):
 
 
 class OrderSelectDropdown(discord.ui.Select):
+    """Select an order to interact with - DEPRECATED, kept for compatibility"""
 
     def __init__(self, orders, bot_instance, refresh_callback):
         options = [
@@ -520,6 +446,7 @@ class OrderSelectDropdown(discord.ui.Select):
 
 
 class MarketInteractView(discord.ui.View):
+    """View for interacting with market orders (buy/sell) - UPDATED with acceptance system"""
 
     def __init__(
         self, order_type: str, bot_instance=None, refresh_callback=None
@@ -539,7 +466,14 @@ class MarketInteractView(discord.ui.View):
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM market_orders WHERE order_type = ? ORDER BY order_id ASC LIMIT 25",
+                """
+                SELECT mo.*, mos.status as order_status
+                FROM market_orders mo
+                LEFT JOIN market_order_status mos ON mo.order_id = mos.order_id
+                WHERE mo.order_type = ? AND mos.status IN ('OPEN', 'PARTIAL')
+                ORDER BY mo.order_id ASC
+                LIMIT 25
+                """,
                 (self.order_type,),
             )
             orders = cursor.fetchall()
@@ -552,11 +486,233 @@ class MarketInteractView(discord.ui.View):
 
         view = discord.ui.View(timeout=300)
         view.add_item(
-            OrderSelectDropdown(orders, interaction.client, self.refresh_callback)
+            MarketOrderSelectDropdown(orders, self.bot, self.refresh_callback)
         )
         await interaction.response.send_message(
-            "Select an offer below:", view=view, ephemeral=True
+            "Select an offer below to express interest:", view=view, ephemeral=True
         )
+
+
+class MarketOrderSelectDropdown(discord.ui.Select):
+    """Select an order to express interest in."""
+
+    def __init__(self, orders, bot_instance, refresh_callback):
+        options = []
+        for o in orders[:25]:
+            status_emoji = "🟢" if o['order_status'] == 'OPEN' else "🟡"
+            
+            # Check if user already has a pending acceptance
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM market_acceptances WHERE order_id = ? AND user_id = ? AND status = 'PENDING'",
+                    (o["order_id"], bot_instance.user.id if bot_instance else 0)
+                )
+                count_row = cursor.fetchone()
+                has_pending = count_row["count"] > 0 if count_row else False
+            
+            status_indicator = "⏳" if has_pending else ""
+            
+            options.append(
+                discord.SelectOption(
+                    label=f"{status_emoji} {status_indicator} Order {o['order_id']:03d} - {o['party_id']}",
+                    description=f"{o['shares_count']:.2f} shares @ ${o['price_per_share']:.2f}",
+                    value=str(o["order_id"]),
+                )
+            )
+        
+        super().__init__(
+            placeholder="Select an order to express interest...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.orders = {str(o["order_id"]): o for o in orders}
+        self.bot = bot_instance
+        self.refresh_callback = refresh_callback
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.orders[self.values[0]]
+        
+        # Check if user is trying to interact with their own order
+        if selected["user_id"] == interaction.user.id:
+            await interaction.response.send_message(
+                "❌ You cannot express interest in your own order.",
+                ephemeral=True
+            )
+            return
+        
+        # Check if user already has a pending acceptance for this order
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM market_acceptances WHERE order_id = ? AND user_id = ? AND status = 'PENDING'",
+                (selected["order_id"], interaction.user.id)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                await interaction.response.send_message(
+                    "⏳ You already have a pending acceptance for this order. Please wait for the owner to respond.",
+                    ephemeral=True
+                )
+                return
+        
+        # Show modal to confirm acceptance
+        modal = ConfirmAcceptanceModal(selected, self.bot, self.refresh_callback)
+        await interaction.response.send_modal(modal)
+
+
+class ConfirmAcceptanceModal(discord.ui.Modal, title="Express Interest in Offer"):
+    """Modal for confirming interest in an offer."""
+
+    def __init__(self, order, bot_instance, refresh_callback):
+        super().__init__(timeout=120)
+        self.order = order
+        self.bot = bot_instance
+        self.refresh_callback = refresh_callback
+        
+        # Calculate max shares
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(shares_count), 0) as total FROM market_acceptances WHERE order_id = ? AND status IN ('PENDING', 'ACCEPTED')",
+                (order["order_id"],)
+            )
+            row = cursor.fetchone()
+            accepted_so_far = row["total"] if row else 0.0
+            self.max_shares = order["shares_count"] - accepted_so_far
+        
+        order_type_label = "BUY" if order["order_type"] == "BUY" else "SELL"
+        self.add_item(discord.ui.TextInput(
+            label=f"Shares (max {self.max_shares:.2f})",
+            placeholder=f"Enter shares up to {self.max_shares:.2f}",
+            required=True,
+            style=discord.TextStyle.short,
+            custom_id="shares_input"
+        ))
+        
+        self.add_item(discord.ui.TextInput(
+            label=f"Price: ${order['price_per_share']:.2f} per share",
+            placeholder=f"This is the {order_type_label} price",
+            required=False,
+            style=discord.TextStyle.short,
+            default=f"Total: ${self.max_shares * order['price_per_share']:.2f}",
+            custom_id="info_input"
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        shares_input = None
+        for child in self.children:
+            if child.custom_id == "shares_input":
+                shares_input = child
+                break
+        
+        if not shares_input:
+            await interaction.response.send_message(
+                "❌ Error reading input.", ephemeral=True
+            )
+            return
+        
+        try:
+            shares = float(shares_input.value)
+            if shares <= 0:
+                raise ValueError
+            if shares > self.max_shares:
+                await interaction.response.send_message(
+                    f"❌ You can only accept up to {self.max_shares:.2f} shares.",
+                    ephemeral=True
+                )
+                return
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Please enter a valid positive number.",
+                ephemeral=True
+            )
+            return
+        
+        # Check if user has enough funds/shares
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            if self.order["order_type"] == "SELL":
+                # Buyer needs funds
+                total_cost = shares * self.order["price_per_share"]
+                cursor.execute(
+                    "SELECT balance FROM users WHERE user_id = ?",
+                    (interaction.user.id,)
+                )
+                row = cursor.fetchone()
+                balance = row["balance"] if row else 0.0
+                if balance < total_cost:
+                    await interaction.response.send_message(
+                        f"❌ Insufficient funds! You need **${total_cost:.2f}** but have **${balance:.2f}**.",
+                        ephemeral=True
+                    )
+                    return
+            else:
+                # Seller needs shares
+                cursor.execute(
+                    "SELECT shares_owned FROM shares WHERE user_id = ? AND party_id = ?",
+                    (interaction.user.id, self.order["party_id"])
+                )
+                row = cursor.fetchone()
+                owned = row["shares_owned"] if row else 0.0
+                if owned < shares:
+                    await interaction.response.send_message(
+                        f"❌ You don't have enough shares! You own **{owned:.2f}** but need **{shares:.2f}**.",
+                        ephemeral=True
+                    )
+                    return
+            
+            # Create acceptance
+            cursor.execute(
+                """
+                INSERT INTO market_acceptances (order_id, user_id, shares_count, price_per_share, status)
+                VALUES (?, ?, ?, ?, 'PENDING')
+                """,
+                (self.order["order_id"], interaction.user.id, shares, self.order["price_per_share"])
+            )
+            acceptance_id = cursor.lastrowid
+            
+            # Log transaction
+            cursor.execute(
+                """
+                INSERT INTO transaction_log (user_id, transaction_type, amount, description, party_id)
+                VALUES (?, 'accept_offer', 0, ?, ?)
+                """,
+                (
+                    interaction.user.id,
+                    f"Expressed interest in order #{self.order['order_id']} for {shares:.2f} shares at ${self.order['price_per_share']:.2f}",
+                    self.order["party_id"]
+                )
+            )
+            conn.commit()
+        
+        await interaction.response.send_message(
+            f"✅ You've expressed interest in **{shares:.2f}** shares at **${self.order['price_per_share']:.2f}**.\n"
+            f"📋 The order owner has been notified and can accept or reject your interest.\n"
+            f"You'll be notified if they accept.",
+            ephemeral=True
+        )
+        
+        # Notify the order owner
+        try:
+            owner = await self.bot.fetch_user(self.order["user_id"])
+            if owner:
+                await owner.send(
+                    f"🔔 **New Interest in Your Offer!**\n"
+                    f"**Order #{self.order['order_id']}** - {self.order['party_id']}\n"
+                    f"**User:** {interaction.user.display_name}\n"
+                    f"**Shares:** {shares:.2f}\n"
+                    f"**Price:** ${self.order['price_per_share']:.2f}\n"
+                    f"**Total:** ${shares * self.order['price_per_share']:.2f}\n\n"
+                    f"Use `/manage_stock` to accept or reject this interest."
+                )
+        except:
+            pass
+        
+        if interaction.guild_id:
+            await self.refresh_callback(interaction.guild_id)
 
 
 class PartySetupModal(discord.ui.Modal, title="Add Initial Party"):
@@ -705,21 +861,37 @@ class TreasuryPartySelect(discord.ui.Select):
 
 
 class ManageStockOrderSelect(discord.ui.Select):
+    """Select an order to manage with acceptance queue support."""
 
     def __init__(self, orders, refresh_callback):
-        options = [
-            discord.SelectOption(
-                label=f"Order {o['order_id']:03d} ({o['order_type']}) - {o['party_id']}",
-                description=f"{o['shares_count']:.2f} shares @ ${o['price_per_share']:.2f}",
-                value=str(o["order_id"]),
+        options = []
+        for o in orders:
+            order_status = o.get("order_status", "OPEN")
+            status_emoji = "🟢" if order_status == "OPEN" else "🟡" if order_status == "PARTIAL" else "✅"
+            
+            # Get acceptance count
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM market_acceptances WHERE order_id = ? AND status = 'PENDING'",
+                    (o["order_id"],)
+                )
+                count_row = cursor.fetchone()
+                pending_count = count_row["count"] if count_row else 0
+            
+            options.append(
+                discord.SelectOption(
+                    label=f"{status_emoji} Order {o['order_id']:03d} ({o['order_type']}) - {o['party_id']}",
+                    description=f"{o['shares_count']:.2f} shares @ ${o['price_per_share']:.2f} [{pending_count} pending]",
+                    value=str(o["order_id"]),
+                )
             )
-            for o in orders
-        ]
+        
         super().__init__(
             placeholder="Select an active listing to inspect or cancel...",
             min_values=1,
             max_values=1,
-            options=options,
+            options=options[:25],
         )
         self.orders = {str(o["order_id"]): o for o in orders}
         self.refresh_callback = refresh_callback
@@ -733,6 +905,44 @@ class ManageStockOrderSelect(discord.ui.Select):
                 (selected["order_id"],),
             )
             counters = cursor.fetchall()
+            
+            # Get pending acceptances
+            cursor.execute(
+                """
+                SELECT * FROM market_acceptances 
+                WHERE order_id = ? AND status = 'PENDING'
+                ORDER BY created_at ASC
+                """,
+                (selected["order_id"],)
+            )
+            pending_acceptances = cursor.fetchall()
+            
+            # Get accepted acceptances
+            cursor.execute(
+                """
+                SELECT * FROM market_acceptances 
+                WHERE order_id = ? AND status = 'ACCEPTED'
+                ORDER BY created_at ASC
+                """,
+                (selected["order_id"],)
+            )
+            accepted_acceptances = cursor.fetchall()
+            
+            # Get order status
+            cursor.execute(
+                "SELECT status FROM market_order_status WHERE order_id = ?",
+                (selected["order_id"],)
+            )
+            status_row = cursor.fetchone()
+            order_status = status_row["status"] if status_row else "OPEN"
+            
+            # Get total accepted shares
+            cursor.execute(
+                "SELECT COALESCE(SUM(shares_count), 0) as total FROM market_acceptances WHERE order_id = ? AND status IN ('PENDING', 'ACCEPTED')",
+                (selected["order_id"],)
+            )
+            total_row = cursor.fetchone()
+            total_accepted = total_row["total"] if total_row else 0.0
 
         embed = discord.Embed(
             title=f"📊 Listing `{selected['order_id']:03d}` Details",
@@ -740,27 +950,50 @@ class ManageStockOrderSelect(discord.ui.Select):
                 f"**Type:** {selected['order_type']}\n"
                 f"**Entity ID:** {selected['party_id']}\n"
                 f"**Shares:** {selected['shares_count']:.2f}\n"
-                f"**Asking Price:** ${selected['price_per_share']:.2f}\n"
-                f"**Counter Offers:** {len(counters)}"
+                f"**Price:** ${selected['price_per_share']:.2f}\n"
+                f"**Status:** {order_status}\n"
+                f"**Remaining:** {selected['shares_count'] - total_accepted:.2f}\n"
+                f"**Counter Offers:** {len(counters)}\n"
+                f"**Pending Acceptances:** {len(pending_acceptances)}\n"
+                f"**Accepted:** {len(accepted_acceptances)}"
             ),
             color=discord.Color.purple(),
         )
 
-        view = OrderManageView(selected, counters, self.refresh_callback)
+        view = OrderManageView(selected, counters, pending_acceptances, accepted_acceptances, self.refresh_callback)
         await interaction.response.edit_message(
             embed=embed, view=view, content=None
         )
 
 
 class OrderManageView(discord.ui.View):
+    """View for managing a specific order with acceptance queue."""
 
-    def __init__(self, order, counters, refresh_callback):
+    def __init__(self, order, counters, pending_acceptances, accepted_acceptances, refresh_callback):
         super().__init__(timeout=300)
         self.order = order
         self.refresh_callback = refresh_callback
 
         if counters:
             self.add_item(CounterSelect(order, counters, refresh_callback))
+        
+        if pending_acceptances:
+            self.add_item(AcceptanceSelect(order, pending_acceptances, refresh_callback, "pending"))
+        
+        if accepted_acceptances:
+            self.add_item(AcceptanceSelect(order, accepted_acceptances, refresh_callback, "accepted"))
+
+    @discord.ui.button(
+        label="✏️ Edit Price",
+        style=discord.ButtonStyle.primary,
+        row=1,
+    )
+    async def edit_price(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        """Open modal to edit order price."""
+        modal = EditPriceModal(self.order, self.refresh_callback)
+        await interaction.response.send_modal(modal)
 
     @discord.ui.button(
         label="🗑️ Delete Listing",
@@ -770,6 +1003,7 @@ class OrderManageView(discord.ui.View):
     async def delete_order(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
+        """Cancel and delete the order."""
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -784,20 +1018,19 @@ class OrderManageView(discord.ui.View):
                 )
                 return
 
+            # Refund shares or funds based on order type
             if current_order["order_type"] == "BUY":
-                refund = (
-                    current_order["shares_count"]
-                    * current_order["price_per_share"]
-                )
+                refund = current_order["shares_count"] * current_order["price_per_share"]
                 cursor.execute(
                     "UPDATE users SET balance = balance + ? WHERE user_id = ?",
                     (refund, interaction.user.id),
                 )
             else:
+                # Return shares to user
                 cursor.execute(
                     """
                     INSERT INTO shares (user_id, party_id, shares_owned) VALUES (?, ?, ?)
-                    ON CONFLICT DO UPDATE SET shares_owned = shares_owned + ?
+                    ON CONFLICT(user_id, party_id) DO UPDATE SET shares_owned = shares_owned + ?
                 """,
                     (
                         interaction.user.id,
@@ -807,12 +1040,21 @@ class OrderManageView(discord.ui.View):
                     ),
                 )
 
+            # Delete everything related
             cursor.execute(
                 "DELETE FROM market_orders WHERE order_id = ?",
                 (self.order["order_id"],),
             )
             cursor.execute(
                 "DELETE FROM counter_offers WHERE order_id = ?",
+                (self.order["order_id"],),
+            )
+            cursor.execute(
+                "DELETE FROM market_acceptances WHERE order_id = ?",
+                (self.order["order_id"],),
+            )
+            cursor.execute(
+                "DELETE FROM market_order_status WHERE order_id = ?",
                 (self.order["order_id"],),
             )
             conn.commit()
@@ -827,7 +1069,245 @@ class OrderManageView(discord.ui.View):
             await self.refresh_callback(interaction.guild_id)
 
 
+class EditPriceModal(discord.ui.Modal, title="Edit Order Price"):
+    """Modal for editing the price of an order."""
+    
+    new_price = discord.ui.TextInput(
+        label="New Price Per Share",
+        placeholder="e.g. 2.50",
+        required=True,
+        style=discord.TextStyle.short
+    )
+    
+    def __init__(self, order, refresh_callback):
+        super().__init__(timeout=120)
+        self.order = order
+        self.refresh_callback = refresh_callback
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_price = float(self.new_price.value)
+            if new_price <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Please enter a valid positive number.",
+                ephemeral=True
+            )
+            return
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE market_orders SET price_per_share = ? WHERE order_id = ?",
+                (new_price, self.order["order_id"])
+            )
+            cursor.execute(
+                "UPDATE market_order_status SET updated_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+                (self.order["order_id"],)
+            )
+            conn.commit()
+        
+        await interaction.response.send_message(
+            f"✅ Price updated to **${new_price:.2f}** for order #{self.order['order_id']:03d}.",
+            ephemeral=True
+        )
+        
+        if interaction.guild_id:
+            await self.refresh_callback(interaction.guild_id)
+
+
+class AcceptanceSelect(discord.ui.Select):
+    """Select an acceptance to accept or reject."""
+
+    def __init__(self, order, acceptances, refresh_callback, acceptance_type="pending"):
+        self.acceptance_type = acceptance_type
+        
+        if acceptance_type == "pending":
+            label_prefix = "⏳ Pending"
+            options = [
+                discord.SelectOption(
+                    label=f"{label_prefix} from User {a['user_id']}",
+                    description=f"{a['shares_count']:.2f} shares @ ${a['price_per_share']:.2f}",
+                    value=str(a["acceptance_id"]),
+                )
+                for a in acceptances[:25]
+            ]
+        else:
+            label_prefix = "✅ Accepted"
+            options = [
+                discord.SelectOption(
+                    label=f"{label_prefix} from User {a['user_id']}",
+                    description=f"{a['shares_count']:.2f} shares @ ${a['price_per_share']:.2f}",
+                    value=str(a["acceptance_id"]),
+                )
+                for a in acceptances[:25]
+            ]
+        
+        super().__init__(
+            placeholder=f"Select a {acceptance_type} acceptance to manage...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.order = order
+        self.acceptances = {str(a["acceptance_id"]): a for a in acceptances}
+        self.refresh_callback = refresh_callback
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.acceptances[self.values[0]]
+        
+        # If pending, show accept/reject options
+        if self.acceptance_type == "pending":
+            view = PendingAcceptanceView(
+                self.order,
+                selected,
+                self.refresh_callback
+            )
+            embed = discord.Embed(
+                title=f"⏳ Pending Acceptance #{selected['acceptance_id']}",
+                description=(
+                    f"**User:** <@{selected['user_id']}>\n"
+                    f"**Shares:** {selected['shares_count']:.2f}\n"
+                    f"**Price:** ${selected['price_per_share']:.2f}\n"
+                    f"**Total:** ${selected['shares_count'] * selected['price_per_share']:.2f}\n"
+                    f"**Created:** <t:{int(datetime.datetime.fromisoformat(selected['created_at']).timestamp())}:R>"
+                ),
+                color=discord.Color.gold()
+            )
+            await interaction.response.edit_message(embed=embed, view=view)
+        else:
+            # Show accepted acceptance details
+            embed = discord.Embed(
+                title=f"✅ Accepted Acceptance #{selected['acceptance_id']}",
+                description=(
+                    f"**User:** <@{selected['user_id']}>\n"
+                    f"**Shares:** {selected['shares_count']:.2f}\n"
+                    f"**Price:** ${selected['price_per_share']:.2f}\n"
+                    f"**Total:** ${selected['shares_count'] * selected['price_per_share']:.2f}\n"
+                    f"**Accepted:** <t:{int(datetime.datetime.fromisoformat(selected['created_at']).timestamp())}:R>"
+                ),
+                color=discord.Color.green()
+            )
+            await interaction.response.edit_message(embed=embed, view=None)
+
+
+class PendingAcceptanceView(discord.ui.View):
+    """View for accepting or rejecting a pending acceptance."""
+
+    def __init__(self, order, acceptance, refresh_callback):
+        super().__init__(timeout=300)
+        self.order = order
+        self.acceptance = acceptance
+        self.refresh_callback = refresh_callback
+
+    @discord.ui.button(label="✅ Accept Offer", style=discord.ButtonStyle.success)
+    async def accept_offer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Accept the buyer's offer and execute the trade."""
+        # Check if user is the order owner
+        if interaction.user.id != self.order["user_id"]:
+            await interaction.response.send_message(
+                "❌ Only the order owner can accept offers.",
+                ephemeral=True
+            )
+            return
+        
+        # Check if order still has enough shares
+        remaining = get_order_remaining_shares(self.order["order_id"])
+        if remaining < self.acceptance["shares_count"]:
+            await interaction.response.send_message(
+                f"❌ Not enough shares remaining. Only {remaining:.2f} shares left.",
+                ephemeral=True
+            )
+            return
+        
+        # Execute the trade
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            buyer_id = self.acceptance["user_id"]
+            seller_id = self.order["user_id"]
+            
+            # The order is from the seller (SELL order), the acceptance is from a buyer
+            await execute_trade(
+                conn,
+                cursor,
+                buyer_id,
+                seller_id,
+                self.order["party_id"],
+                self.acceptance["shares_count"],
+                self.order["price_per_share"],
+                "SELL",
+                self.order["order_id"],
+                self.acceptance["acceptance_id"]
+            )
+            conn.commit()
+        
+        await interaction.response.edit_message(
+            content=f"✅ Trade executed! {self.acceptance['shares_count']:.2f} shares sold to <@{buyer_id}> at ${self.order['price_per_share']:.2f}.",
+            embed=None,
+            view=None
+        )
+        
+        # Notify the buyer
+        try:
+            buyer = await interaction.client.fetch_user(buyer_id)
+            if buyer:
+                await buyer.send(
+                    f"✅ **Your offer was accepted!**\n"
+                    f"**Order #{self.order['order_id']}** - {self.order['party_id']}\n"
+                    f"**Shares:** {self.acceptance['shares_count']:.2f}\n"
+                    f"**Price:** ${self.order['price_per_share']:.2f}\n"
+                    f"**Total:** ${self.acceptance['shares_count'] * self.order['price_per_share']:.2f}"
+                )
+        except:
+            pass
+        
+        if interaction.guild_id:
+            await self.refresh_callback(interaction.guild_id)
+
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger)
+    async def reject_offer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Reject the acceptance."""
+        if interaction.user.id != self.order["user_id"]:
+            await interaction.response.send_message(
+                "❌ Only the order owner can reject offers.",
+                ephemeral=True
+            )
+            return
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE market_acceptances SET status = 'REJECTED' WHERE acceptance_id = ?",
+                (self.acceptance["acceptance_id"],)
+            )
+            conn.commit()
+        
+        # Notify the buyer
+        try:
+            buyer = await interaction.client.fetch_user(self.acceptance["user_id"])
+            if buyer:
+                await buyer.send(
+                    f"❌ **Your offer was rejected.**\n"
+                    f"**Order #{self.order['order_id']}** - {self.order['party_id']}\n"
+                    f"The order owner has rejected your interest."
+                )
+        except:
+            pass
+        
+        await interaction.response.edit_message(
+            content=f"❌ Rejected acceptance from <@{self.acceptance['user_id']}>.",
+            embed=None,
+            view=None
+        )
+        
+        if interaction.guild_id:
+            await self.refresh_callback(interaction.guild_id)
+
+
 class CounterSelect(discord.ui.Select):
+    """Select a counter-offer to accept."""
 
     def __init__(self, order, counter_offers, refresh_callback):
         options = [
@@ -884,6 +1364,7 @@ class CounterSelect(discord.ui.Select):
                     )
                     return
 
+            # Execute trade with the counter-offer price
             await execute_trade(
                 conn,
                 cursor,
@@ -894,6 +1375,7 @@ class CounterSelect(discord.ui.Select):
                 selected_offer["price"],
                 self.order["order_type"],
                 self.order["order_id"],
+                None  # No acceptance ID for counter-offers
             )
             conn.commit()
 
@@ -947,7 +1429,9 @@ class HistoryView(discord.ui.View):
                 "loan": "💳",
                 "repay_loan": "💰",
                 "pay_debt": "💵",
-                "admin_add_balance": "🛠️"
+                "admin_add_balance": "🛠️",
+                "accept_offer": "🤝",
+                "buy_from_bot": "🤖"
             }
             emoji = emoji_map.get(tx["transaction_type"], "📊")
             

@@ -1,5 +1,3 @@
-# database.py - Full file with fixed execute_trade
-
 import sqlite3
 import datetime
 
@@ -15,6 +13,33 @@ def get_db():
 def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS special_coupons (
+                coupon_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                user_id INTEGER,
+                amount REAL DEFAULT 300.00,
+                claimed_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                redeemed_by INTEGER,
+                redeemed_at TIMESTAMP
+            )
+        """
+        )
+
+        cursor.execute("PRAGMA table_info(users)")
+        u_cols = [col["name"] for col in cursor.fetchall()]
+        if "last_daily" not in u_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_daily TIMESTAMP")
+        if "last_weekly" not in u_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_weekly TIMESTAMP")
+        if "last_monthly" not in u_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_monthly TIMESTAMP")
+        if "last_yearly" not in u_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_yearly TIMESTAMP")
+        if "last_coupon" not in u_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_coupon TIMESTAMP")
 
         cursor.execute(
             """
@@ -220,6 +245,36 @@ def init_db():
                 amount REAL,
                 payment_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(request_id) REFERENCES loan_requests(request_id)
+            )
+        """
+        )
+
+        # ─── NEW: Market Order Acceptance Queue ──────────────────────────────
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_acceptances (
+                acceptance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                shares_count REAL NOT NULL,
+                price_per_share REAL NOT NULL,
+                status TEXT DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                executed_at TIMESTAMP,
+                FOREIGN KEY(order_id) REFERENCES market_orders(order_id) ON DELETE CASCADE,
+                UNIQUE(order_id, user_id)
+            )
+        """
+        )
+
+        # ─── NEW: Market Order Status Table ──────────────────────────────────
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_order_status (
+                order_id INTEGER PRIMARY KEY,
+                status TEXT DEFAULT 'OPEN',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(order_id) REFERENCES market_orders(order_id) ON DELETE CASCADE
             )
         """
         )
@@ -656,6 +711,77 @@ def get_transaction_count(user_id: int) -> int:
         return row["total"] if row else 0
 
 
+def get_order_acceptances(order_id: int, status: str = None):
+    """Get all acceptances for a market order."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if status:
+            cursor.execute(
+                """
+                SELECT * FROM market_acceptances 
+                WHERE order_id = ? AND status = ?
+                ORDER BY created_at ASC
+                """,
+                (order_id, status)
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM market_acceptances 
+                WHERE order_id = ?
+                ORDER BY created_at ASC
+                """,
+                (order_id,)
+            )
+        return cursor.fetchall()
+
+
+def get_order_acceptance_count(order_id: int, status: str = None) -> int:
+    """Get count of acceptances for a market order."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if status:
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM market_acceptances WHERE order_id = ? AND status = ?",
+                (order_id, status)
+            )
+        else:
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM market_acceptances WHERE order_id = ?",
+                (order_id,)
+            )
+        row = cursor.fetchone()
+        return row["count"] if row else 0
+
+
+def get_total_accepted_shares(order_id: int) -> float:
+    """Get total shares accepted for an order."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(SUM(shares_count), 0) as total FROM market_acceptances WHERE order_id = ? AND status = 'ACCEPTED'",
+            (order_id,)
+        )
+        row = cursor.fetchone()
+        return row["total"] if row else 0.0
+
+
+def get_order_remaining_shares(order_id: int) -> float:
+    """Get remaining shares available on an order."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT shares_count FROM market_orders WHERE order_id = ?",
+            (order_id,)
+        )
+        order = cursor.fetchone()
+        if not order:
+            return 0.0
+        
+        total_accepted = get_total_accepted_shares(order_id)
+        return max(0.0, order["shares_count"] - total_accepted)
+
+
 async def execute_trade(
     conn,
     cursor,
@@ -666,7 +792,9 @@ async def execute_trade(
     trade_price,
     order_type,
     order_id,
+    acceptance_id: int = None,
 ):
+    """Execute a trade, optionally from an acceptance."""
     total_cost = trade_price * shares
 
     # 1. Fetch entity metrics
@@ -746,7 +874,6 @@ async def execute_trade(
         )
 
     # 3. Apply Treasury shift based on price difference from standard cost
-    # *** FIXED: Apply to BOTH companies AND parties ***
     price_diff_per_share = trade_price - standard_cost
     total_treasury_shift = price_diff_per_share * shares
     
@@ -766,10 +893,31 @@ async def execute_trade(
         (party_id, new_price),
     )
 
-    # 4. Clean up order & counter-offers
-    cursor.execute(
-        "DELETE FROM market_orders WHERE order_id = ?", (order_id,)
-    )
-    cursor.execute(
-        "DELETE FROM counter_offers WHERE order_id = ?", (order_id,)
-    )
+    # 4. Mark acceptance as executed if provided
+    if acceptance_id:
+        cursor.execute(
+            "UPDATE market_acceptances SET status = 'EXECUTED', executed_at = CURRENT_TIMESTAMP WHERE acceptance_id = ?",
+            (acceptance_id,)
+        )
+    
+    # 5. Check if order is fully filled, update status
+    remaining = get_order_remaining_shares(order_id)
+    if remaining <= 0.001:
+        cursor.execute(
+            "UPDATE market_order_status SET status = 'FILLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+            (order_id,)
+        )
+        # Delete the order and its acceptances
+        cursor.execute("DELETE FROM market_orders WHERE order_id = ?", (order_id,))
+        cursor.execute("DELETE FROM counter_offers WHERE order_id = ?", (order_id,))
+        cursor.execute("DELETE FROM market_acceptances WHERE order_id = ?", (order_id,))
+    else:
+        # Update order shares count
+        cursor.execute(
+            "UPDATE market_orders SET shares_count = ? WHERE order_id = ?",
+            (remaining, order_id)
+        )
+        cursor.execute(
+            "UPDATE market_order_status SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+            (order_id,)
+        )

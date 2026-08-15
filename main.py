@@ -196,25 +196,42 @@ class EconomyBot(commands.Bot):
 
         # Initialize safety systems
         await setup_safety(self)
+
+        # Load all cogs
+        cogs_to_load = [
+            "cogs.admin",
+            "cogs.company",
+            "cogs.market",
+            "cogs.economy",
+            "cogs.events",
+            "cogs.shout",
+            "cogs.rewards",
+        ]
         
-        # Set audit log channel if you have one (uncomment and set)
-        # SAFETY_CONFIG["security_log_channel"] = YOUR_AUDIT_CHANNEL_ID
+        for cog in cogs_to_load:
+            try:
+                await self.load_extension(cog)
+                print(f"✅ Loaded {cog}")
+            except Exception as e:
+                print(f"❌ Failed to load {cog}: {e}")
 
-        await self.load_extension("cogs.admin")
-        await self.load_extension("cogs.company")
-        await self.load_extension("cogs.market")
-        await self.load_extension("cogs.economy")
-        await self.load_extension("cogs.events")
-        await self.load_extension("cogs.shout")
-
+        # Force sync commands to guild - normal way
         guild = discord.Object(id=self.GUILD_ID)
+        
+        # Clear existing commands
+        self.tree.clear_commands(guild=guild)
+        await self.tree.sync(guild=guild)
+        
+        # Copy global commands and sync
         self.tree.copy_global_to(guild=guild)
-
+        
         try:
             synced = await self.tree.sync(guild=guild)
-            print(
-                f"✅ Instantly synced {len(synced)} commands to guild {self.GUILD_ID}."
-            )
+            print(f"✅ Synced {len(synced)} commands to guild {self.GUILD_ID}")
+            for cmd in synced[:10]:
+                print(f"   - /{cmd.name}")
+            if len(synced) > 10:
+                print(f"   ... and {len(synced) - 10} more")
         except Exception as e:
             print(f"❌ Failed to sync guild commands: {e}")
 

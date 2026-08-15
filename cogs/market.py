@@ -1,8 +1,8 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from database import get_db
-from views import BuyFromBotView, ManageStockOrderSelect
+from database import get_db, get_order_acceptances, get_order_remaining_shares, get_total_accepted_shares
+from views import BuyFromBotView, ManageStockOrderSelect, MarketInteractView
 from utils.errors import SmartErrorMessages
 from cogs.modals import ConfirmPurchaseModal, ConfirmSellModal
 
@@ -172,6 +172,13 @@ class MarketCog(commands.Cog):
                     """,
                         (interaction.user.id, clean_party_id, shares, actual_price),
                     )
+                    order_id = cursor.lastrowid
+                    
+                    # Initialize order status
+                    cursor.execute(
+                        "INSERT INTO market_order_status (order_id, status) VALUES (?, 'OPEN')",
+                        (order_id,)
+                    )
                     
                     # Log transaction
                     cursor.execute(
@@ -186,7 +193,8 @@ class MarketCog(commands.Cog):
                 if guild_id:
                     await self.bot.refresh_market_embeds(guild_id)
                 await modal_interaction.response.send_message(
-                    f"✅ Posted buy offer for **{shares:.2f}** share(s) of **{party['name']}** at **${actual_price:.2f}** each!",
+                    f"✅ Posted buy offer for **{shares:.2f}** share(s) of **{party['name']}** at **${actual_price:.2f}** each!\n"
+                    f"📋 Sellers can accept your offer using the market buttons.",
                     ephemeral=True
                 )
 
@@ -259,6 +267,9 @@ class MarketCog(commands.Cog):
         async def execute_sell(modal_interaction: discord.Interaction):
             with get_db() as conn:
                 cursor = conn.cursor()
+                # Hold the shares in escrow - they're locked until the order is filled or cancelled
+                # We reduce the user's shares and track them in the order
+                # This prevents double-selling
                 cursor.execute(
                     "UPDATE shares SET shares_owned = shares_owned - ? WHERE user_id = ? AND party_id = ?",
                     (shares, interaction.user.id, clean_party_id),
@@ -269,6 +280,13 @@ class MarketCog(commands.Cog):
                     VALUES (?, ?, 'SELL', ?, ?)
                 """,
                     (interaction.user.id, clean_party_id, shares, price_per_share),
+                )
+                order_id = cursor.lastrowid
+                
+                # Initialize order status
+                cursor.execute(
+                    "INSERT INTO market_order_status (order_id, status) VALUES (?, 'OPEN')",
+                    (order_id,)
                 )
                 
                 # Log transaction
@@ -284,7 +302,8 @@ class MarketCog(commands.Cog):
             if guild_id:
                 await self.bot.refresh_market_embeds(guild_id)
             await modal_interaction.response.send_message(
-                f"✅ Posted sell offer for **{shares:.2f}** share(s) of **{party['name']}** at **${price_per_share:.2f}** each!",
+                f"✅ Posted sell offer for **{shares:.2f}** share(s) of **{party['name']}** at **${price_per_share:.2f}** each!\n"
+                f"📋 Buyers can accept your offer using the market buttons.",
                 ephemeral=True
             )
 
@@ -299,14 +318,19 @@ class MarketCog(commands.Cog):
 
     @app_commands.command(
         name="manage_stock",
-        description="Inspect counter-offers or cancel your active stock listings.",
+        description="Inspect counter-offers, acceptances, or cancel your active stock listings.",
     )
     async def manage_stock(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM market_orders WHERE user_id = ?",
+                """
+                SELECT mo.*, mos.status as order_status
+                FROM market_orders mo
+                LEFT JOIN market_order_status mos ON mo.order_id = mos.order_id
+                WHERE mo.user_id = ?
+                """,
                 (interaction.user.id,),
             )
             orders = cursor.fetchall()
@@ -324,6 +348,82 @@ class MarketCog(commands.Cog):
         await interaction.followup.send(
             "Select one of your active listings to manage:", view=view
         )
+
+    @app_commands.command(
+        name="check_stock",
+        description="📊 Check your active stock orders and acceptances."
+    )
+    async def check_stock(self, interaction: discord.Interaction):
+        """View all your active orders and their acceptance status."""
+        import datetime
+        await interaction.response.defer(ephemeral=True)
+        
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Get user's active orders
+            cursor.execute(
+                """
+                SELECT mo.*, mos.status as order_status,
+                       (SELECT COUNT(*) FROM market_acceptances WHERE order_id = mo.order_id AND status = 'PENDING') as pending_acceptances,
+                       (SELECT COUNT(*) FROM market_acceptances WHERE order_id = mo.order_id AND status = 'ACCEPTED') as accepted_acceptances,
+                       (SELECT COALESCE(SUM(shares_count), 0) FROM market_acceptances WHERE order_id = mo.order_id AND status IN ('PENDING', 'ACCEPTED')) as total_accepted_shares
+                FROM market_orders mo
+                LEFT JOIN market_order_status mos ON mo.order_id = mos.order_id
+                WHERE mo.user_id = ?
+                ORDER BY mo.created_at DESC
+                """,
+                (interaction.user.id,)
+            )
+            orders = cursor.fetchall()
+            
+            if not orders:
+                await interaction.followup.send(
+                    "📭 You have no active stock orders.",
+                    ephemeral=True
+                )
+                return
+            
+            embed = discord.Embed(
+                title="📊 Your Active Stock Orders",
+                color=discord.Color.blue(),
+                timestamp=datetime.datetime.now()
+            )
+            
+            for order in orders:
+                party_name = order["party_id"]
+                cursor.execute("SELECT name FROM parties WHERE party_id = ?", (order["party_id"],))
+                party = cursor.fetchone()
+                if party:
+                    party_name = party["name"]
+                
+                status_emoji = {
+                    "OPEN": "🟢",
+                    "PARTIAL": "🟡",
+                    "FILLED": "✅",
+                    "CANCELLED": "❌"
+                }.get(order["order_status"], "🟢")
+                
+                order_type_emoji = "📈" if order["order_type"] == "BUY" else "📉"
+                
+                remaining = order["shares_count"] - order["total_accepted_shares"]
+                
+                embed.add_field(
+                    name=f"{status_emoji} {order_type_emoji} Order #{order['order_id']} - {party_name}",
+                    value=(
+                        f"**Type:** {order['order_type']}\n"
+                        f"**Shares:** {order['shares_count']:.2f} total ({order['total_accepted_shares']:.2f} accepted, {remaining:.2f} remaining)\n"
+                        f"**Price:** ${order['price_per_share']:.2f}\n"
+                        f"**Status:** {order['order_status']}\n"
+                        f"**Pending Acceptances:** {order['pending_acceptances']}\n"
+                        f"**Accepted:** {order['accepted_acceptances']}\n"
+                        f"*Use `/manage_stock` to view acceptances or cancel*"
+                    ),
+                    inline=False
+                )
+            
+            embed.set_footer(text="Use /manage_stock to interact with acceptances")
+            await interaction.followup.send(embed=embed)
 
 
 async def setup(bot):

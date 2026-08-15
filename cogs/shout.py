@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from database import get_db, get_user_managed_parties
 from safety import safety_wrapper, financial_safety, InputValidator
 from utils.errors import SmartErrorMessages
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 
 class ShoutCog(commands.Cog):
     """Shout system with 5-hour admin strike window and treasury support."""
@@ -128,6 +128,11 @@ class ShoutCog(commands.Cog):
                             INSERT INTO shout_messages (shout_id, user_id, status)
                             VALUES (?, ?, 'SENT')
                         """, (shout_id, member.id))
+                        # Update shout_received_count for coupon tracking
+                        cursor.execute("""
+                            INSERT INTO shout_received_counts (user_id, count) VALUES (?, 1)
+                            ON CONFLICT(user_id) DO UPDATE SET count = count + 1
+                        """, (member.id,))
                         conn.commit()
                     
                 except discord.Forbidden:
@@ -757,7 +762,7 @@ class ShoutCog(commands.Cog):
         include_bots: bool,
         sender: discord.User
     ):
-        """Process the shout."""
+        """Process the shout with coupon tracking."""
         try:
             # Check if it's a treasury shout
             with get_db() as conn:
@@ -819,6 +824,11 @@ class ShoutCog(commands.Cog):
                             INSERT INTO shout_messages (shout_id, user_id, status)
                             VALUES (?, ?, 'SENT')
                         """, (shout_id, member.id))
+                        # Update shout_received_count for coupon tracking
+                        cursor.execute("""
+                            INSERT INTO shout_received_counts (user_id, count) VALUES (?, 1)
+                            ON CONFLICT(user_id) DO UPDATE SET count = count + 1
+                        """, (member.id,))
                         conn.commit()
                     
                 except discord.Forbidden:
